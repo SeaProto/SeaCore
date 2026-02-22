@@ -1,0 +1,28 @@
+[package]
+name = "seacore"
+description = "SeaCore Proxy: Combined Client and Server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+seacore-protocol = { path = "../seacore-protocol" }
+quinn = { workspace = true }
+rustls = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+bytes = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+eyre = { workspace = true }
+parking_lot = { workspace = true }
+rcgen = "0.13"
+clap = { version = "4.5", features = ["derive"] }
+ring = "0.17"
+x25519-dalek = { version = "2.0.0", features = ["getrandom", "static_secrets"] }
+rand_core = "0.10.0"
+base64 = "0.22"
+rand = "0.8"

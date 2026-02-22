@@ -1,0 +1,176 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - Cargo.toml
+
+permissions:
+  contents: write
+
+jobs:
+  detect-version:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.version.outputs.changed }}
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      previous_tag: ${{ steps.version.outputs.previous_tag }}
+      tag_exists: ${{ steps.version.outputs.tag_exists }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect version change
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          parse_version() {
+            awk '
+              /^\[workspace\.package\]/ { in_section=1; next }
+              /^\[/ { in_section=0 }
+              in_section && $1 == "version" {
+                gsub(/\r/, "", $3)
+                gsub(/"/, "", $3)
+                print $3
+                exit
+              }
+            '
+          }
+
+          version="$(parse_version < Cargo.toml)"
+          if [[ -z "${version}" ]]; then
+            echo "Failed to parse [workspace.package].version from Cargo.toml"
+            exit 1
+          fi
+
+          before_sha="${{ github.event.before }}"
+          old_version=""
+
+          if [[ "${before_sha}" != "0000000000000000000000000000000000000000" ]]; then
+            old_toml="$(git show "${before_sha}:Cargo.toml" 2>/dev/null || true)"
+            if [[ -n "${old_toml}" ]]; then
+              old_version="$(printf "%s\n" "${old_toml}" | parse_version || true)"
+            fi
+          fi
+
+          changed="false"
+          if [[ -z "${old_version}" || "${old_version}" != "${version}" ]]; then
+            changed="true"
+          fi
+
+          tag="v${version}"
+          previous_tag=""
+          if [[ "${before_sha}" != "0000000000000000000000000000000000000000" ]]; then
+            previous_tag="$(git describe --tags --abbrev=0 --match 'v*' "${before_sha}" 2>/dev/null || true)"
+          else
+            previous_tag="$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)"
+          fi
+
+          tag_exists="false"
+          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            tag_exists="true"
+          fi
+
+          {
+            echo "changed=${changed}"
+            echo "version=${version}"
+            echo "tag=${tag}"
+            echo "previous_tag=${previous_tag}"
+            echo "tag_exists=${tag_exists}"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: detect-version
+    if: needs.detect-version.outputs.changed == 'true' && needs.detect-version.outputs.tag_exists == 'false'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            exe_suffix: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            exe_suffix: ".exe"
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            exe_suffix: ""
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release -p seacore --target ${{ matrix.target }}
+
+      - name: Prepare artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          src="target/${{ matrix.target }}/release/seacore${{ matrix.exe_suffix }}"
+          dst="dist/seacore-${{ needs.detect-version.outputs.version }}-${{ matrix.target }}${{ matrix.exe_suffix }}"
+          cp "${src}" "${dst}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: seacore-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs:
+      - detect-version
+      - build
+    if: needs.detect-version.outputs.changed == 'true' && needs.detect-version.outputs.tag_exists == 'false'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Build release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          notes_file="release_notes.md"
+          previous_tag="${{ needs.detect-version.outputs.previous_tag }}"
+
+          {
+            echo "# Commit"
+            echo
+            if [[ -n "${previous_tag}" ]]; then
+              git log "${previous_tag}..HEAD" --pretty=format:'- %s'
+            else
+              git log --pretty=format:'- %s'
+            fi
+            echo
+          } > "${notes_file}"
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.detect-version.outputs.tag }}
+          name: ${{ needs.detect-version.outputs.tag }}
+          body_path: release_notes.md
+          files: dist/**/*
