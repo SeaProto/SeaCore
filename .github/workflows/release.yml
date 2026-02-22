@@ -155,14 +155,15 @@ jobs:
           set -euo pipefail
           notes_file="release_notes.md"
           previous_tag="${{ needs.detect-version.outputs.previous_tag }}"
+          repo_url="https://github.com/${{ github.repository }}"
 
           {
-            echo "# Commit"
+            echo "# Commits"
             echo
             if [[ -n "${previous_tag}" ]]; then
-              git log "${previous_tag}..HEAD" --pretty=format:'- %s'
+              git log "${previous_tag}..HEAD" --pretty=format:"- %s ([\`%h\`](${repo_url}/commit/%H))"
             else
-              git log --pretty=format:'- %s'
+              git log --pretty=format:"- %s ([\`%h\`](${repo_url}/commit/%H))"
             fi
             echo
           } > "${notes_file}"
