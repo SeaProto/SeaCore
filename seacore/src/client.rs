@@ -3,6 +3,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 
@@ -11,7 +13,7 @@ use quinn::Endpoint;
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use seacore_protocol::protocol::Address;
@@ -24,7 +26,7 @@ use rand::rngs::OsRng;
 use rand::Rng;
 
 use rustls::internal::msgs::handshake::{ClientExtension, UnknownExtension};
-use rustls::internal::msgs::enums::{ExtensionType, ProtocolVersion};
+use rustls::internal::msgs::enums::ExtensionType;
 use rustls::internal::msgs::base::Payload;
 
 fn get_grease_u16() -> u16 {
@@ -46,6 +48,9 @@ pub struct ClientConfig {
     pub max_idle_time_secs: Option<u64>,
     #[allow(dead_code)]
     pub max_udp_relay_packet_size: Option<usize>,
+    pub idle_session_check_interval_secs: Option<u64>,
+    pub idle_session_timeout_secs: Option<u64>,
+    pub min_idle_sessions: Option<usize>,
     pub reality: Option<RealitySettings>,
 }
 
@@ -64,6 +69,26 @@ fn default_server_name() -> String {
 
 type PacketSender = mpsc::Sender<(bytes::Bytes, Address)>;
 type UdpRoutes = Arc<Mutex<HashMap<u16, PacketSender>>>;
+type UdpRouteTouches = Arc<Mutex<HashMap<u16, Instant>>>;
+
+#[derive(Clone)]
+struct IdleSessionPolicy {
+    check_interval: Duration,
+    timeout: Duration,
+    min_idle_sessions: usize,
+}
+
+fn idle_session_policy_from_client_config(config: &ClientConfig) -> IdleSessionPolicy {
+    let check_secs = config.idle_session_check_interval_secs.unwrap_or(5).max(1);
+    let timeout_secs = config.idle_session_timeout_secs.unwrap_or(10).max(2);
+    let min_idle_sessions = config.min_idle_sessions.unwrap_or(0);
+
+    IdleSessionPolicy {
+        check_interval: Duration::from_secs(check_secs),
+        timeout: Duration::from_secs(timeout_secs),
+        min_idle_sessions,
+    }
+}
 
 static NEXT_ASSOC_ID: AtomicU16 = AtomicU16::new(1);
 
@@ -211,16 +236,16 @@ fn build_tls_config(config: &ClientConfig) -> Result<rustls::ClientConfig> {
 pub async fn run_client(config_path: &str) -> Result<()> {
     let config_str = fs::read_to_string(config_path)?;
     let config: Arc<ClientConfig> = Arc::new(serde_json::from_str(&config_str)?);
+    let idle_policy = Arc::new(idle_session_policy_from_client_config(&config));
 
     info!("Server: {}", config.server);
     info!("SOCKS5 listen: {}", config.socks5_listen);
-
-    let client_crypto = build_tls_config(&config)?;
-    let tcp_tls_config_base = client_crypto.clone();
-
-    let mut client_config = quinn::ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)?,
-    ));
+    info!(
+        "Idle session policy: check={}s timeout={}s min_idle={}",
+        idle_policy.check_interval.as_secs(),
+        idle_policy.timeout.as_secs(),
+        idle_policy.min_idle_sessions
+    );
 
     let mut transport_config = quinn::TransportConfig::default();
 
@@ -260,18 +285,14 @@ pub async fn run_client(config_path: &str) -> Result<()> {
     transport_config.min_mtu(1200);
     // Note: quinn 0.11 enables grease_quic_bit by default (RFC 9287)
 
-    client_config.transport_config(Arc::new(transport_config));
+    let transport_config = Arc::new(transport_config);
 
     let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
-    endpoint.set_default_client_config(client_config);
 
     // Start SOCKS5 listener (shared across reconnections)
     let listener = Arc::new(TcpListener::bind(config.socks5_listen).await?);
     info!("SOCKS5 listening on {}", config.socks5_listen);
     
-    let mut tcp_tls_config = tcp_tls_config_base.clone();
-    tcp_tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-
     // Auto-reconnect loop with exponential backoff
     let mut backoff_secs = 1u64;
     const MAX_BACKOFF: u64 = 60;
@@ -280,6 +301,17 @@ pub async fn run_client(config_path: &str) -> Result<()> {
 
     loop {
         info!("Connecting to {}... (mode: {})", config.server, transport_mode);
+
+        // Refresh Reality token/session id on every reconnect attempt.
+        let base_tls_config = build_tls_config(&config)?;
+        let mut client_config = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(base_tls_config.clone())?,
+        ));
+        client_config.transport_config(transport_config.clone());
+        endpoint.set_default_client_config(client_config);
+
+        let mut tcp_tls_config = base_tls_config;
+        tcp_tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
         let mut connected_inner = None;
         let mut tcp_read_half: Option<Box<dyn tokio::io::AsyncRead + Unpin + Send>> = None;
@@ -432,11 +464,13 @@ pub async fn run_client(config_path: &str) -> Result<()> {
         });
 
         let udp_routes: UdpRoutes = Arc::new(Mutex::new(HashMap::new()));
+        let udp_route_touches: UdpRouteTouches = Arc::new(Mutex::new(HashMap::new()));
 
         // Background task for receiving server packets
         let bg_conn = conn.clone();
         let bg_seacore = seacore_conn.clone();
         let bg_routes = udp_routes.clone();
+        let bg_route_touches = udp_route_touches.clone();
         let disconnect_tx_bg = disconnect_tx.clone();
         let mut tcp_read = tcp_read_half;
         let bg_task = tokio::spawn(async move {
@@ -453,8 +487,15 @@ pub async fn run_client(config_path: &str) -> Result<()> {
                                                     let assoc_id = pkt.assoc_id();
                                                     let addr = pkt.addr().clone();
                                                     if let Ok(payload) = pkt.payload().await {
-                                                        let routes = bg_routes.lock().await;
-                                                        if let Some(tx) = routes.get(&assoc_id) {
+                                                        {
+                                                            let mut touches = bg_route_touches.lock().await;
+                                                            touches.insert(assoc_id, Instant::now());
+                                                        }
+                                                        let tx_opt = {
+                                                            let routes = bg_routes.lock().await;
+                                                            routes.get(&assoc_id).cloned()
+                                                        };
+                                                        if let Some(tx) = tx_opt {
                                                             let _ = tx.send((payload, addr)).await;
                                                         }
                                                     }
@@ -488,13 +529,21 @@ pub async fn run_client(config_path: &str) -> Result<()> {
                                     Ok(recv) => {
                                         let bg_seacore_clone = bg_seacore.clone();
                                         let bg_routes_clone = bg_routes.clone();
+                                        let bg_route_touches_clone = bg_route_touches.clone();
                                         tokio::spawn(async move {
                                             if let Ok(Task::Packet(pkt)) = bg_seacore_clone.accept_uni_stream(seacore_protocol::quic::SeaCoreReadStream::Quic(recv)).await {
                                                 let assoc_id = pkt.assoc_id();
                                                 let addr = pkt.addr().clone();
                                                 if let Ok(payload) = pkt.payload().await {
-                                                    let routes = bg_routes_clone.lock().await;
-                                                    if let Some(tx) = routes.get(&assoc_id) {
+                                                    {
+                                                        let mut touches = bg_route_touches_clone.lock().await;
+                                                        touches.insert(assoc_id, Instant::now());
+                                                    }
+                                                    let tx_opt = {
+                                                        let routes = bg_routes_clone.lock().await;
+                                                        routes.get(&assoc_id).cloned()
+                                                    };
+                                                    if let Some(tx) = tx_opt {
                                                         let _ = tx.send((payload, addr)).await;
                                                     }
                                                 }
@@ -514,6 +563,7 @@ pub async fn run_client(config_path: &str) -> Result<()> {
                     if let Some(mut recv) = tcp_read.take() {
                         let bg_seacore_clone = bg_seacore.clone();
                         let bg_routes_clone = bg_routes.clone();
+                        let bg_route_touches_clone = bg_route_touches.clone();
                         loop {
                             match bg_seacore_clone.next_tcp_task(recv.as_mut()).await {
                                 Ok(task) => {
@@ -522,8 +572,15 @@ pub async fn run_client(config_path: &str) -> Result<()> {
                                             let assoc_id = pkt.assoc_id();
                                             let addr = pkt.addr().clone();
                                             if let Ok(payload) = pkt.payload().await {
-                                                let routes = bg_routes_clone.lock().await;
-                                                if let Some(tx) = routes.get(&assoc_id) {
+                                                {
+                                                    let mut touches = bg_route_touches_clone.lock().await;
+                                                    touches.insert(assoc_id, Instant::now());
+                                                }
+                                                let tx_opt = {
+                                                    let routes = bg_routes_clone.lock().await;
+                                                    routes.get(&assoc_id).cloned()
+                                                };
+                                                if let Some(tx) = tx_opt {
                                                     let _ = tx.send((payload, addr)).await;
                                                 }
                                             }
@@ -553,9 +610,49 @@ pub async fn run_client(config_path: &str) -> Result<()> {
             }
         });
 
+        // AnyTLS-style idle session cleanup for UDP routes.
+        let udp_routes_cleanup = udp_routes.clone();
+        let udp_route_touches_cleanup = udp_route_touches.clone();
+        let idle_policy_cleanup = idle_policy.clone();
+        let mut janitor_disconnect_rx = disconnect_tx.subscribe();
+        let janitor_task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = janitor_disconnect_rx.changed() => {
+                        break;
+                    }
+                    _ = tokio::time::sleep(idle_policy_cleanup.check_interval) => {
+                        let now = Instant::now();
+                        let mut routes = udp_routes_cleanup.lock().await;
+                        let mut touches = udp_route_touches_cleanup.lock().await;
+
+                        touches.retain(|assoc_id, _| routes.contains_key(assoc_id));
+
+                        let mut entries: Vec<(u16, Instant)> = touches
+                            .iter()
+                            .map(|(assoc_id, ts)| (*assoc_id, *ts))
+                            .collect();
+                        entries.sort_by_key(|(_, ts)| Reverse(*ts));
+
+                        let keep = idle_policy_cleanup.min_idle_sessions.min(entries.len());
+                        for (idx, (assoc_id, last_active)) in entries.into_iter().enumerate() {
+                            if idx < keep {
+                                continue;
+                            }
+                            if now.saturating_duration_since(last_active) >= idle_policy_cleanup.timeout {
+                                routes.remove(&assoc_id);
+                                touches.remove(&assoc_id);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
         // Accept SOCKS5 connections until disconnect signal
         let listener_ref = listener.clone();
         let config_socks = config.clone();
+        let idle_policy_socks = idle_policy.clone();
         let socks_task = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -567,9 +664,11 @@ pub async fn run_client(config_path: &str) -> Result<()> {
                             Ok((stream, peer_addr)) => {
                                 let sc = seacore_conn.clone();
                                 let ur = udp_routes.clone();
+                                let ut = udp_route_touches.clone();
+                                let ip = idle_policy_socks.clone();
                                 let cfg = config_socks.clone();
                                 tokio::spawn(async move {
-                                    if let Err(e) = handle_inbound(stream, sc, peer_addr, ur, cfg).await {
+                                    if let Err(e) = handle_inbound(stream, sc, peer_addr, ur, ut, ip, cfg).await {
                                         warn!("Inbound handler error for {}: {}", peer_addr, e);
                                     }
                                 });
@@ -588,6 +687,7 @@ pub async fn run_client(config_path: &str) -> Result<()> {
         hb_task.abort();
         pad_task.abort();
         bg_task.abort();
+        janitor_task.abort();
         if let seacore_protocol::quic::InnerConn::Quic(q) = &conn {
             q.close(quinn::VarInt::from_u32(0x00), b"reconnecting");
         }
@@ -602,15 +702,99 @@ async fn handle_inbound(
     conn: Connection<side::Client>,
     peer_addr: SocketAddr,
     udp_routes: UdpRoutes,
+    udp_route_touches: UdpRouteTouches,
+    idle_policy: Arc<IdleSessionPolicy>,
     config: Arc<ClientConfig>,
 ) -> Result<()> {
     let mut version_buf = [0u8; 1];
     stream.read_exact(&mut version_buf).await?;
     
     match version_buf[0] {
-        0x05 => handle_socks5_logic(stream, conn, peer_addr, udp_routes, config).await,
-        0x04 => handle_socks4(stream, conn, peer_addr, config).await,
+        0x05 => handle_socks5_logic(stream, conn, peer_addr, udp_routes, udp_route_touches, idle_policy, config).await,
+        0x04 => handle_socks4(stream, conn, peer_addr, idle_policy.timeout, config).await,
         v => Err(eyre::eyre!("unsupported proxy version: {}", v)),
+    }
+}
+
+async fn relay_until_either_side_finishes<L, R>(
+    left: L,
+    right: R,
+    relay_idle_timeout: Duration,
+) -> std::io::Result<()>
+where
+    L: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    R: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let (mut left_read, mut left_write) = tokio::io::split(left);
+    let (mut right_read, mut right_write) = tokio::io::split(right);
+    let mut left_buf = vec![0u8; 8192];
+    let mut right_buf = vec![0u8; 8192];
+
+    let relay_result = async {
+        loop {
+            tokio::select! {
+                left_read_result = tokio::time::timeout(relay_idle_timeout, left_read.read(&mut left_buf)) => {
+                    let n = match left_read_result {
+                        Ok(Ok(n)) => n,
+                        Ok(Err(e)) => return Err(e),
+                        Err(_) => return Ok(()), // Idle timeout.
+                    };
+                    if n == 0 {
+                        return Ok(());
+                    }
+                    right_write.write_all(&left_buf[..n]).await?;
+                }
+                right_read_result = tokio::time::timeout(relay_idle_timeout, right_read.read(&mut right_buf)) => {
+                    let n = match right_read_result {
+                        Ok(Ok(n)) => n,
+                        Ok(Err(e)) => return Err(e),
+                        Err(_) => return Ok(()), // Idle timeout.
+                    };
+                    if n == 0 {
+                        return Ok(());
+                    }
+                    left_write.write_all(&right_buf[..n]).await?;
+                }
+            }
+        }
+    }
+    .await;
+
+    // On reset/abort paths (e.g. 10054), graceful TLS shutdown can become expensive.
+    // Only try a bounded graceful close on normal EOF; otherwise drop halves directly.
+    if relay_result.is_ok() {
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            tokio::io::AsyncWriteExt::shutdown(&mut left_write),
+        )
+        .await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            tokio::io::AsyncWriteExt::shutdown(&mut right_write),
+        )
+        .await;
+    }
+
+    relay_result.map(|_| ())
+}
+
+fn is_expected_relay_io_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::TimedOut
+    )
+}
+
+fn log_relay_error(prefix: &str, peer_addr: SocketAddr, err: std::io::Error) {
+    if is_expected_relay_io_error(&err) {
+        debug!("{} for {}: {}", prefix, peer_addr, err);
+    } else {
+        warn!("{} for {}: {}", prefix, peer_addr, err);
     }
 }
 
@@ -618,6 +802,7 @@ async fn handle_socks4(
     mut stream: tokio::net::TcpStream,
     conn: Connection<side::Client>,
     peer_addr: SocketAddr,
+    relay_idle_timeout: Duration,
     config: Arc<ClientConfig>,
 ) -> Result<()> {
     // SOCKS4 handshake (already read VN=0x04)
@@ -670,49 +855,38 @@ async fn handle_socks4(
         let domain_sni = config.reality.as_ref().map(|r| r.server_name.clone()).unwrap_or_else(|| "apple.com".into());
         let server_name = rustls::pki_types::ServerName::try_from(domain_sni.as_str())?.to_owned();
         
-        let tls_stream = connector.connect(server_name, tcp_stream).await?;
-        let (mut r, mut w) = tokio::io::split(tls_stream);
+        let mut tls_stream = connector.connect(server_name, tcp_stream).await?;
         
         // Authenticate
         let uuid = config.uuid;
         let model = seacore_protocol::model::Connection::<Vec<u8>>::new();
         let auth_data = model.send_authenticate(uuid, &config.password, None::<&NoExporter>);
         let header = seacore_protocol::protocol::Header::Authenticate(auth_data);
-        header.async_marshal(&mut w).await?;
+        header.async_marshal(&mut tls_stream).await?;
         
         // Connect
         let conn_data = model.send_connect(addr.clone());
         let header_conn = seacore_protocol::protocol::Header::Connect(conn_data);
-        header_conn.async_marshal(&mut w).await?;
+        header_conn.async_marshal(&mut tls_stream).await?;
         
         info!("SOCKS4 TCP Fallback: {} -> {}", peer_addr, addr);
         
         // Reply: Granted
         stream.write_all(&[0x00, 0x5A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]).await?;
-        
-        let (mut ri, mut wi) = stream.into_split();
-        let upload = tokio::io::copy(&mut ri, &mut w);
-        let download = tokio::io::copy(&mut r, &mut wi);
-        
-        tokio::select! {
-            _ = upload => {}
-            _ = download => {}
+
+        if let Err(e) = relay_until_either_side_finishes(stream, tls_stream, relay_idle_timeout).await {
+            log_relay_error("SOCKS4 TCP relay error", peer_addr, e);
         }
     } else {
         // QUIC mode
         match conn.connect(addr.clone()).await {
-            Ok(mut bistream) => {
+            Ok(bistream) => {
                 info!("SOCKS4 QUIC: {} -> {}", peer_addr, addr);
                 // Reply: Granted
                 stream.write_all(&[0x00, 0x5A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]).await?;
-                
-                let (mut ri, mut wi) = stream.into_split();
-                let upload = tokio::io::copy(&mut ri, &mut bistream.send);
-                let download = tokio::io::copy(&mut bistream.recv, &mut wi);
-                
-                tokio::select! {
-                    _ = upload => {}
-                    _ = download => {}
+
+                if let Err(e) = relay_until_either_side_finishes(stream, bistream, relay_idle_timeout).await {
+                    log_relay_error("SOCKS4 QUIC relay error", peer_addr, e);
                 }
             }
             Err(e) => {
@@ -730,6 +904,8 @@ async fn handle_socks5_logic(
     conn: Connection<side::Client>,
     peer_addr: SocketAddr,
     udp_routes: UdpRoutes,
+    udp_route_touches: UdpRouteTouches,
+    idle_policy: Arc<IdleSessionPolicy>,
     config: Arc<ClientConfig>,
 ) -> Result<()> {
     // ── SOCKS5 handshake ──────────────────────────
@@ -804,15 +980,41 @@ async fn handle_socks5_logic(
         }
         stream.write_all(&reply).await?;
 
+        // SOCKS5 UDP ASSOCIATE keeps this TCP control channel open.
+        // If it is closed by upstream (e.g. Xray/browser), we must tear
+        // down the UDP route promptly; otherwise stale routes accumulate.
+        let (mut ctrl_read, _) = stream.into_split();
+        let (ctrl_closed_tx, mut ctrl_closed_rx) = tokio::sync::watch::channel(false);
+        let ctrl_watch_task = tokio::spawn(async move {
+            let mut buf = [0u8; 1];
+            loop {
+                match ctrl_read.read(&mut buf).await {
+                    Ok(0) => {
+                        let _ = ctrl_closed_tx.send(true);
+                        break;
+                    }
+                    Ok(_) => {
+                        // Ignore unexpected control bytes and keep waiting for closure.
+                    }
+                    Err(_) => {
+                        let _ = ctrl_closed_tx.send(true);
+                        break;
+                    }
+                }
+            }
+        });
+
         let assoc_id = NEXT_ASSOC_ID.fetch_add(1, Ordering::SeqCst);
         let (tx, mut rx) = mpsc::channel(1024);
         udp_routes.lock().await.insert(assoc_id, tx);
+        udp_route_touches.lock().await.insert(assoc_id, Instant::now());
 
         let socket_arc = Arc::new(local_socket);
         let socket_recv = socket_arc.clone();
         
         let client_udp_addr = Arc::new(Mutex::new(None));
         let upload_client_addr = client_udp_addr.clone();
+        let route_touches_upload = udp_route_touches.clone();
         
         let client_conn = conn.clone();
         // Task to read UDP from client and send over QUIC
@@ -822,6 +1024,7 @@ async fn handle_socks5_logic(
                 match socket_recv.recv_from(&mut buf).await {
                     Ok((n, client_addr)) => {
                         *upload_client_addr.lock().await = Some(client_addr);
+                        route_touches_upload.lock().await.insert(assoc_id, Instant::now());
                         let data = &buf[..n];
                         // Parse SOCKS5 UDP header
                         if data.len() < 10 || data[0] != 0 || data[1] != 0 {
@@ -866,39 +1069,62 @@ async fn handle_socks5_logic(
             }
         });
 
-        // Loop to receive from QUIC and send back to SOCKS client
-        while let Some((payload, source_addr)) = rx.recv().await {
-            // Build SOCKS5 UDP response header
-            let mut pkt = vec![0x00, 0x00, 0x00];
-            match source_addr {
-                Address::SocketAddress(SocketAddr::V4(v4)) => {
-                    pkt.push(0x01);
-                    pkt.extend_from_slice(&v4.ip().octets());
-                    pkt.extend_from_slice(&v4.port().to_be_bytes());
+        // Loop to receive from SeaCore and send back to SOCKS client.
+        // Also stop on control-channel close or route idle timeout.
+        let udp_assoc_idle_timeout = idle_policy.timeout;
+        loop {
+            tokio::select! {
+                _ = ctrl_closed_rx.changed() => {
+                    break;
                 }
-                Address::SocketAddress(SocketAddr::V6(v6)) => {
-                    pkt.push(0x04);
-                    pkt.extend_from_slice(&v6.ip().octets());
-                    pkt.extend_from_slice(&v6.port().to_be_bytes());
+                maybe_item = tokio::time::timeout(udp_assoc_idle_timeout, rx.recv()) => {
+                    let Some((payload, source_addr)) = (match maybe_item {
+                        Ok(item) => item,
+                        Err(_) => {
+                            // Idle for too long, clean up this association.
+                            debug!("UDP ASSOCIATE {} for {} hit idle timeout", assoc_id, peer_addr);
+                            break;
+                        }
+                    }) else {
+                        break;
+                    };
+
+                    // Build SOCKS5 UDP response header
+                    let mut pkt = vec![0x00, 0x00, 0x00];
+                    match source_addr {
+                        Address::SocketAddress(SocketAddr::V4(v4)) => {
+                            pkt.push(0x01);
+                            pkt.extend_from_slice(&v4.ip().octets());
+                            pkt.extend_from_slice(&v4.port().to_be_bytes());
+                        }
+                        Address::SocketAddress(SocketAddr::V6(v6)) => {
+                            pkt.push(0x04);
+                            pkt.extend_from_slice(&v6.ip().octets());
+                            pkt.extend_from_slice(&v6.port().to_be_bytes());
+                        }
+                        Address::DomainAddress(domain, port) => {
+                            pkt.push(0x03);
+                            pkt.push(domain.len() as u8);
+                            pkt.extend_from_slice(domain.as_bytes());
+                            pkt.extend_from_slice(&port.to_be_bytes());
+                        }
+                        Address::None => continue,
+                    }
+                    pkt.extend_from_slice(&payload);
+
+                    if let Some(caddr) = *client_udp_addr.lock().await {
+                        udp_route_touches.lock().await.insert(assoc_id, Instant::now());
+                        let _ = socket_arc.send_to(&pkt, caddr).await;
+                    }
                 }
-                Address::DomainAddress(domain, port) => {
-                    pkt.push(0x03);
-                    pkt.push(domain.len() as u8);
-                    pkt.extend_from_slice(domain.as_bytes());
-                    pkt.extend_from_slice(&port.to_be_bytes());
-                }
-                Address::None => continue,
-            }
-            pkt.extend_from_slice(&payload);
-            
-            if let Some(caddr) = *client_udp_addr.lock().await {
-                let _ = socket_arc.send_to(&pkt, caddr).await;
             }
         }
 
         upload_task.abort();
+        ctrl_watch_task.abort();
         let _ = conn.dissociate(assoc_id).await;
         udp_routes.lock().await.remove(&assoc_id);
+        udp_route_touches.lock().await.remove(&assoc_id);
         
         return Ok(());
     }
@@ -919,35 +1145,26 @@ async fn handle_socks5_logic(
         let server_name = rustls::pki_types::ServerName::try_from(domain.as_str())?.to_owned();
         
         // 1. Establish TLS with Reality Tokens
-        let tls_stream = connector.connect(server_name, tcp_stream).await?;
-        let (mut r, mut w) = tokio::io::split(tls_stream);
+        let mut tls_stream = connector.connect(server_name, tcp_stream).await?;
         
         // 2. Send Authenticate Command manually over the raw TLS stream
         let uuid = config.uuid;
-        let mut model = seacore_protocol::model::Connection::<Vec<u8>>::new();
+        let model = seacore_protocol::model::Connection::<Vec<u8>>::new();
         let auth_data = model.send_authenticate(uuid, &config.password, None::<&NoExporter>);
         let header = seacore_protocol::protocol::Header::Authenticate(auth_data);
-        header.async_marshal(&mut w).await?;
+        header.async_marshal(&mut tls_stream).await?;
         
         // 3. Send Connect Command
         let conn_data = model.send_connect(addr.clone());
         let header_conn = seacore_protocol::protocol::Header::Connect(conn_data);
-        header_conn.async_marshal(&mut w).await?;
+        header_conn.async_marshal(&mut tls_stream).await?;
 
         info!("SOCKS5 TCP Fallback: {} -> {}", peer_addr, addr);
         
         stream.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
-        
-        let mut ri_tcp = r;
-        let mut w_tcp = w;
-        
-        let (mut ri, mut wi) = stream.into_split();
-        let upload = tokio::io::copy(&mut ri, &mut w_tcp);
-        let download = tokio::io::copy(&mut ri_tcp, &mut wi);
-        
-        tokio::select! {
-            r_res = upload => { r_res?; }
-            r_res = download => { r_res?; }
+
+        if let Err(e) = relay_until_either_side_finishes(stream, tls_stream, idle_policy.timeout).await {
+            log_relay_error("SOCKS5 TCP relay error", peer_addr, e);
         }
         return Ok(());
     } else {
@@ -964,16 +1181,8 @@ async fn handle_socks5_logic(
     // SOCKS5 success reply
     stream.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
 
-    // Bidirectional relay
-    let (mut ri, mut wi) = stream.into_split();
-    let (mut ro, mut wo) = tokio::io::split(remote);
-
-    let upload = tokio::io::copy(&mut ri, &mut wo);
-    let download = tokio::io::copy(&mut ro, &mut wi);
-
-    tokio::select! {
-        r_res = upload => { r_res?; }
-        r_res = download => { r_res?; }
+    if let Err(e) = relay_until_either_side_finishes(stream, remote, idle_policy.timeout).await {
+        log_relay_error("SOCKS5 QUIC relay error", peer_addr, e);
     }
 
     Ok(())

@@ -16,6 +16,9 @@ To overcome active probing and Deep Packet Inspection (DPI), SeaCore incorporate
 *   **Pure Transparent TCP Fallback**: Listens on both TCP and UDP. Incoming TCP scans are blindly piped to the REALITY destination, ensuring port scanners see a flawless HTTPS/2 Web Server, avoiding "UDP-only" heuristic bans.
 *   **Hybrid Transport Support**: Configure `transport` as `"udp"`, `"tcp"`, or `"auto"` to adapt to different network censorship environments (e.g., UDP QoS/blocking in China or Iran).
 *   **Traffic Camouflage & H3 SETTINGS**: Injects randomized heartbeat datagrams and HTTP/3 initialization frames to defeat Machine Learning packet-size and timing analysis models.
+*   **Reconnect Handshake Refresh**: After connection loss, client reconnects with a fresh TCP/TLS/REALITY auth context, avoiding stale-session handshake corruption.
+*   **Relay Teardown Hardening**: On reset/abort paths (including `10054`), relay exits quickly with bounded shutdown to prevent long-lived CPU buildup.
+*   **Configurable Idle Session Janitor**: Client and server both support idle route cleanup via `idle_session_check_interval_secs`, `idle_session_timeout_secs`, and `min_idle_sessions`.
 
 ## Compilation
 
@@ -40,6 +43,9 @@ To start the server, you need a configuration file (`server.json`) and a generat
 {
   "listen": "0.0.0.0:4430",
   "transport": "auto",
+  "idle_session_check_interval_secs": 5,
+  "idle_session_timeout_secs": 10,
+  "min_idle_sessions": 0,
   "users": [
     {
       "uuid": "your-uuid-here",
@@ -68,6 +74,9 @@ To start the client, you need a corresponding `client.json` with the matching `p
 {
     "server": "your_server_ip:4430",
     "transport": "udp",
+    "idle_session_check_interval_secs": 5,
+    "idle_session_timeout_secs": 10,
+    "min_idle_sessions": 0,
     "uuid": "your-uuid-here",
     "password": "my-secure-password",
     "socks5_listen": "127.0.0.1:10800",
@@ -84,6 +93,26 @@ Start the client process:
 ```bash
 ./target/release/seacore client -c client.json
 ```
+
+## CPU/Session Tuning
+
+Both client and server accept the same optional idle cleanup parameters:
+
+*   `idle_session_check_interval_secs`: janitor sweep interval (default: `5`)
+*   `idle_session_timeout_secs`: idle threshold before relay/assoc cleanup (default: `10`)
+*   `min_idle_sessions`: always keep this many most-recent idle sessions (default: `0`)
+
+Recommended baseline for low-resource VPS:
+
+```json
+{
+  "idle_session_check_interval_secs": 2,
+  "idle_session_timeout_secs": 6,
+  "min_idle_sessions": 0
+}
+```
+
+If you chain another local proxy layer (for example Xray -> SeaCore SOCKS), start with the defaults and then lower timeout/check interval gradually to reduce residual idle CPU cost.
 
 ## Usage (Proxy Inbound)
 
