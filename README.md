@@ -8,14 +8,14 @@ To overcome active probing and Deep Packet Inspection (DPI), SeaCore incorporate
 
 ## Features
 
+*   **Multi-Protocol Inbound**: Built-in SOCKS5 and SOCKS4/SOCKS4a support with automatic protocol detection on the inbound port.
 *   **Deep QUIC Masquerading (craftls)**: Emulates Chrome and Firefox's EXACT TLS 1.3 `ClientHello` structures, including GREASE extensions, padding, and ALPN variations.
 *   **REALITY Fallback (Zero Active Probing Signature)**: The server acts as a transparent reverse proxy for a configured white-list domain (e.g., `apple.com`). Unauthorized QUIC/TCP connections are seamlessly relayed to the real destination without breaking the TLS handshake, fully masking the proxy's presence.
-*   **Stable 1:1 TCP Reality Mapping**: When using TCP transport, SeaCore establishes a fresh, independent Reality-authenticated connection for *every* SOCKS5 TCP request. This perfectly mimics real web-browsing behavior and defeats the statistical traffic analysis that often targets single, long-lived multiplexed connections.
+*   **Stable 1:1 TCP Reality Mapping**: When using TCP transport, SeaCore establishes a fresh, independent Reality-authenticated connection for *every* SOCKS5/SOCKS4 TCP request. This perfectly mimics real web-browsing behavior and defeats the statistical traffic analysis that often targets single, long-lived multiplexed connections.
 *   **X25519 Authentication Token**: Uses raw elliptic-curve Diffie-Hellman to encrypt the authentication payload directly into the TLS `SessionID`, leaving absolutely zero protocol metadata on the wire.
 *   **Pure Transparent TCP Fallback**: Listens on both TCP and UDP. Incoming TCP scans are blindly piped to the REALITY destination, ensuring port scanners see a flawless HTTPS/2 Web Server, avoiding "UDP-only" heuristic bans.
 *   **Hybrid Transport Support**: Configure `transport` as `"udp"`, `"tcp"`, or `"auto"` to adapt to different network censorship environments (e.g., UDP QoS/blocking in China or Iran).
 *   **Traffic Camouflage & H3 SETTINGS**: Injects randomized heartbeat datagrams and HTTP/3 initialization frames to defeat Machine Learning packet-size and timing analysis models.
-*   **Native SOCKS5 Proxy**: Built-in support for proxying TCP and UDP ASSOCIATE traffic transparently to your applications.
 
 ## Compilation
 
@@ -85,17 +85,27 @@ Start the client process:
 ./target/release/seacore client -c client.json
 ```
 
-## Usage (SOCKS5 Proxy)
+## Usage (Proxy Inbound)
 
-Once the client is running, you can connect your applications via the SOCKS5 inlet defined in the `client.json` file.
+Once the client is running, you can connect your applications via the SOCKS inlet (SOCKS5/4/4a) defined in the `client.json` file.
 
-### TCP Testing
+### SOCKS5 Testing
 
 ```bash
 curl -x socks5h://127.0.0.1:10800 https://example.com
 ```
 
-### UDP Testing
+### SOCKS4/4a Testing
+
+```bash
+# SOCKS4a (Domain resolution)
+curl --socks4a 127.0.0.1:10800 https://example.com
+
+# SOCKS4 (IP-only)
+curl --socks4 127.0.0.1:10800 http://1.1.1.1
+```
+
+### UDP Testing (SOCKS5 only)
 
 You can use standard SOCKS-compatible UDP tools to route DNS or internal UDP requests over SeaCore.
 If you have a Python environment, you can use the built-in test script to verify UDP associative proxies:

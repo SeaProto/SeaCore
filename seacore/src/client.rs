@@ -569,8 +569,8 @@ pub async fn run_client(config_path: &str) -> Result<()> {
                                 let ur = udp_routes.clone();
                                 let cfg = config_socks.clone();
                                 tokio::spawn(async move {
-                                    if let Err(e) = handle_socks5(stream, sc, peer_addr, ur, cfg).await {
-                                        warn!("SOCKS5 handler error for {}: {}", peer_addr, e);
+                                    if let Err(e) = handle_inbound(stream, sc, peer_addr, ur, cfg).await {
+                                        warn!("Inbound handler error for {}: {}", peer_addr, e);
                                     }
                                 });
                             }
@@ -597,7 +597,135 @@ pub async fn run_client(config_path: &str) -> Result<()> {
     }
 }
 
-async fn handle_socks5(
+async fn handle_inbound(
+    mut stream: tokio::net::TcpStream,
+    conn: Connection<side::Client>,
+    peer_addr: SocketAddr,
+    udp_routes: UdpRoutes,
+    config: Arc<ClientConfig>,
+) -> Result<()> {
+    let mut version_buf = [0u8; 1];
+    stream.read_exact(&mut version_buf).await?;
+    
+    match version_buf[0] {
+        0x05 => handle_socks5_logic(stream, conn, peer_addr, udp_routes, config).await,
+        0x04 => handle_socks4(stream, conn, peer_addr, config).await,
+        v => Err(eyre::eyre!("unsupported proxy version: {}", v)),
+    }
+}
+
+async fn handle_socks4(
+    mut stream: tokio::net::TcpStream,
+    conn: Connection<side::Client>,
+    peer_addr: SocketAddr,
+    config: Arc<ClientConfig>,
+) -> Result<()> {
+    // SOCKS4 handshake (already read VN=0x04)
+    let mut buf = [0u8; 8];
+    stream.read_exact(&mut buf[..7]).await?;
+    
+    let cmd = buf[0];
+    if cmd != 0x01 {
+        // Only CONNECT supported
+        stream.write_all(&[0x00, 0x5B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]).await?;
+        return Err(eyre::eyre!("unsupported SOCKS4 command: {}", cmd));
+    }
+    
+    let port = u16::from_be_bytes([buf[1], buf[2]]);
+    let ip = std::net::Ipv4Addr::new(buf[3], buf[4], buf[5], buf[6]);
+    
+    // Read USERID (NULL terminated)
+    let mut userid = Vec::new();
+    loop {
+        let mut b = [0u8; 1];
+        stream.read_exact(&mut b).await?;
+        if b[0] == 0 { break; }
+        userid.push(b[0]);
+    }
+    
+    let addr = if ip.octets()[0] == 0 && ip.octets()[1] == 0 && ip.octets()[2] == 0 && ip.octets()[3] != 0 {
+        // SOCKS4a: Domain follows USERID
+        let mut domain = Vec::new();
+        loop {
+            let mut b = [0u8; 1];
+            stream.read_exact(&mut b).await?;
+            if b[0] == 0 { break; }
+            domain.push(b[0]);
+        }
+        Address::DomainAddress(String::from_utf8_lossy(&domain).to_string(), port)
+    } else {
+        Address::SocketAddress(SocketAddr::new(std::net::IpAddr::V4(ip), port))
+    };
+    
+    // Choose transport
+    let transport_mode = config.transport.as_deref().unwrap_or("auto").to_lowercase();
+
+    if transport_mode == "tcp" {
+        // 1:1 TCP fallback
+        let server_addr = config.server;
+        let tcp_stream = tokio::net::TcpStream::connect(server_addr).await?;
+        let tcp_tls_config = build_tls_config(&config)?;
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(tcp_tls_config));
+        
+        let domain_sni = config.reality.as_ref().map(|r| r.server_name.clone()).unwrap_or_else(|| "apple.com".into());
+        let server_name = rustls::pki_types::ServerName::try_from(domain_sni.as_str())?.to_owned();
+        
+        let tls_stream = connector.connect(server_name, tcp_stream).await?;
+        let (mut r, mut w) = tokio::io::split(tls_stream);
+        
+        // Authenticate
+        let uuid = config.uuid;
+        let model = seacore_protocol::model::Connection::<Vec<u8>>::new();
+        let auth_data = model.send_authenticate(uuid, &config.password, None::<&NoExporter>);
+        let header = seacore_protocol::protocol::Header::Authenticate(auth_data);
+        header.async_marshal(&mut w).await?;
+        
+        // Connect
+        let conn_data = model.send_connect(addr.clone());
+        let header_conn = seacore_protocol::protocol::Header::Connect(conn_data);
+        header_conn.async_marshal(&mut w).await?;
+        
+        info!("SOCKS4 TCP Fallback: {} -> {}", peer_addr, addr);
+        
+        // Reply: Granted
+        stream.write_all(&[0x00, 0x5A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]).await?;
+        
+        let (mut ri, mut wi) = stream.into_split();
+        let upload = tokio::io::copy(&mut ri, &mut w);
+        let download = tokio::io::copy(&mut r, &mut wi);
+        
+        tokio::select! {
+            _ = upload => {}
+            _ = download => {}
+        }
+    } else {
+        // QUIC mode
+        match conn.connect(addr.clone()).await {
+            Ok(mut bistream) => {
+                info!("SOCKS4 QUIC: {} -> {}", peer_addr, addr);
+                // Reply: Granted
+                stream.write_all(&[0x00, 0x5A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]).await?;
+                
+                let (mut ri, mut wi) = stream.into_split();
+                let upload = tokio::io::copy(&mut ri, &mut bistream.send);
+                let download = tokio::io::copy(&mut bistream.recv, &mut wi);
+                
+                tokio::select! {
+                    _ = upload => {}
+                    _ = download => {}
+                }
+            }
+            Err(e) => {
+                warn!("SOCKS4 QUIC connection failed for {}: {}", addr, e);
+                stream.write_all(&[0x00, 0x5B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]).await?;
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+async fn handle_socks5_logic(
     mut stream: tokio::net::TcpStream,
     conn: Connection<side::Client>,
     peer_addr: SocketAddr,
@@ -607,12 +735,9 @@ async fn handle_socks5(
     // ── SOCKS5 handshake ──────────────────────────
     let mut buf = [0u8; 258];
 
-    // Read version + method count
-    stream.read_exact(&mut buf[..2]).await?;
-    if buf[0] != 0x05 {
-        return Err(eyre::eyre!("unsupported SOCKS version: {}", buf[0]));
-    }
-    let nmethods = buf[1] as usize;
+    // Read method count (we already read version 0x05)
+    stream.read_exact(&mut buf[..1]).await?;
+    let nmethods = buf[0] as usize;
     stream.read_exact(&mut buf[..nmethods]).await?;
 
     // Reply: no authentication required
