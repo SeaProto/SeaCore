@@ -9,7 +9,7 @@ use quinn::{
     ClosedStream, ReadExactError,
 };
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tracing::warn;
 use uuid::Uuid;
@@ -251,15 +251,13 @@ impl Connection<side::Client> {
         match header {
             Header::Packet(pkt) => {
                 let _model_pkt = self.model.recv_packet(pkt.clone());
+                use tokio::io::AsyncReadExt;
                 let size = pkt.size() as usize;
-                // Optimized read: Use BytesMut to avoid double allocation/zeroing if possible
-                let mut buf = BytesMut::with_capacity(size);
-                buf.resize(size, 0);
+                let mut buf = vec![0u8; size];
                 recv.read_exact(&mut buf).await.map_err(|e| Error::Io(e))?;
-                
                 Ok(Task::Packet(PacketTask {
                     header: pkt,
-                    source: PacketSource::Native(buf.freeze()),
+                    source: PacketSource::Native(bytes::Bytes::from(buf)),
                 }))
             }
             Header::Heartbeat(_) => Ok(Task::Heartbeat),
@@ -368,13 +366,13 @@ impl Connection<side::Server> {
             }
             Header::Packet(pkt) => {
                 let _model_pkt = self.model.recv_packet(pkt.clone());
+                use tokio::io::AsyncReadExt;
                 let size = pkt.size() as usize;
-                let mut buf = BytesMut::with_capacity(size);
-                buf.resize(size, 0);
+                let mut buf = vec![0u8; size];
                 recv.read_exact(&mut buf).await.map_err(|e| Error::Io(e))?;
                 Ok(Task::Packet(PacketTask {
                     header: pkt,
-                    source: PacketSource::Native(buf.freeze()),
+                    source: PacketSource::Native(bytes::Bytes::from(buf)),
                 }))
             }
             Header::Heartbeat(_) => Ok(Task::Heartbeat),
