@@ -10,8 +10,10 @@ To overcome active probing and Deep Packet Inspection (DPI), SeaCore incorporate
 
 *   **Deep QUIC Masquerading (craftls)**: Emulates Chrome and Firefox's EXACT TLS 1.3 `ClientHello` structures, including GREASE extensions, padding, and ALPN variations.
 *   **REALITY Fallback (Zero Active Probing Signature)**: The server acts as a transparent reverse proxy for a configured white-list domain (e.g., `apple.com`). Unauthorized QUIC/TCP connections are seamlessly relayed to the real destination without breaking the TLS handshake, fully masking the proxy's presence.
+*   **Stable 1:1 TCP Reality Mapping**: When using TCP transport, SeaCore establishes a fresh, independent Reality-authenticated connection for *every* SOCKS5 TCP request. This perfectly mimics real web-browsing behavior and defeats the statistical traffic analysis that often targets single, long-lived multiplexed connections.
 *   **X25519 Authentication Token**: Uses raw elliptic-curve Diffie-Hellman to encrypt the authentication payload directly into the TLS `SessionID`, leaving absolutely zero protocol metadata on the wire.
 *   **Pure Transparent TCP Fallback**: Listens on both TCP and UDP. Incoming TCP scans are blindly piped to the REALITY destination, ensuring port scanners see a flawless HTTPS/2 Web Server, avoiding "UDP-only" heuristic bans.
+*   **Hybrid Transport Support**: Configure `transport` as `"udp"`, `"tcp"`, or `"auto"` to adapt to different network censorship environments (e.g., UDP QoS/blocking in China or Iran).
 *   **Traffic Camouflage & H3 SETTINGS**: Injects randomized heartbeat datagrams and HTTP/3 initialization frames to defeat Machine Learning packet-size and timing analysis models.
 *   **Native SOCKS5 Proxy**: Built-in support for proxying TCP and UDP ASSOCIATE traffic transparently to your applications.
 
@@ -37,6 +39,7 @@ To start the server, you need a configuration file (`server.json`) and a generat
 ```json
 {
   "listen": "0.0.0.0:4430",
+  "transport": "auto",
   "users": [
     {
       "uuid": "your-uuid-here",
@@ -64,6 +67,7 @@ To start the client, you need a corresponding `client.json` with the matching `p
 ```json
 {
     "server": "your_server_ip:4430",
+    "transport": "udp",
     "uuid": "your-uuid-here",
     "password": "my-secure-password",
     "socks5_listen": "127.0.0.1:10800",
