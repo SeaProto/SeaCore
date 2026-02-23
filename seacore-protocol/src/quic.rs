@@ -1,4 +1,3 @@
-
 use std::io::{self, Cursor};
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -10,11 +9,13 @@ use quinn::{
     ClosedStream, ReadExactError,
 };
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tracing::warn;
 use uuid::Uuid;
+use std::sync::Arc;
 
-use crate::model::{Assemblable, AssembleError, Connection as ConnectionModel, KeyingMaterialExporter as KME};
+use crate::model::{AssembleError, Connection as ConnectionModel, KeyingMaterialExporter as KME};
 use crate::protocol::{Address, Header};
 use crate::unmarshal::UnmarshalError;
 
@@ -29,60 +30,105 @@ pub mod side {
 
 // ── Connection ─────────────────────────────────
 
-/// The SeaCore Connection wrapping a `quinn::Connection`.
+#[derive(Clone)]
+pub enum InnerConn {
+    Quic(QuinnConnection),
+    // Tcp requires an Arc<Mutex> or channels because we need to share ownership
+    // across tasks (ping/heartbeat/read/write loops)
+    Tcp(Arc<tokio::sync::Mutex<Box<dyn tokio::io::AsyncWrite + Send + Unpin>>>),
+}
+
+/// The SeaCore Connection wrapping a QUIC or TCP connection.
 #[derive(Clone)]
 pub struct Connection<Side> {
-    conn: QuinnConnection,
+    pub conn: InnerConn,
     model: ConnectionModel<Bytes>,
     _marker: Side,
 }
 
 impl<Side> Connection<Side> {
     /// Sends a `Packet` using QUIC datagram (native mode, low latency)
-    pub fn packet_native(&self, pkt: impl AsRef<[u8]>, addr: Address, assoc_id: u16) -> Result<(), Error> {
-        let Some(max_pkt_size) = self.conn.max_datagram_size() else {
-            return Err(Error::SendDatagram(SendDatagramError::Disabled));
-        };
+    /// Over TCP, falls back to `packet_stream` natively
+    pub async fn packet_native(&self, pkt: impl AsRef<[u8]>, addr: Address, assoc_id: u16) -> Result<(), Error> {
+        match &self.conn {
+            InnerConn::Quic(q) => {
+                let Some(max_pkt_size) = q.max_datagram_size() else {
+                    return Err(Error::SendDatagram(SendDatagramError::Disabled));
+                };
 
-        let sender = self.model.send_packet(assoc_id, addr, max_pkt_size);
-        for (header, frag) in sender.into_fragments(pkt.as_ref()) {
-            let mut buf = BytesMut::with_capacity(header.len() + frag.len());
-            header.write(&mut buf);
-            buf.put_slice(frag);
-            self.conn.send_datagram(Bytes::from(buf))?;
+                let sender = self.model.send_packet(assoc_id, addr, max_pkt_size);
+                for (header, frag) in sender.into_fragments(pkt.as_ref()) {
+                    let mut buf = BytesMut::with_capacity(header.len() + frag.len());
+                    header.write(&mut buf);
+                    buf.put_slice(frag);
+                    q.send_datagram(Bytes::from(buf))?;
+                }
+                Ok(())
+            }
+            InnerConn::Tcp(_) => {
+                // TCP doesn't have datagrams, fallback strictly to stream-based sending
+                self.packet_stream(pkt, addr, assoc_id).await
+            }
         }
-        Ok(())
     }
 
-    /// Sends a `Packet` using QUIC uni-stream (reliable mode)
-    pub async fn packet_quic(&self, pkt: impl AsRef<[u8]>, addr: Address, assoc_id: u16) -> Result<(), Error> {
+    /// Sends a `Packet` using QUIC uni-stream (reliable mode) or over the shared TCP stream
+    pub async fn packet_stream(&self, pkt: impl AsRef<[u8]>, addr: Address, assoc_id: u16) -> Result<(), Error> {
         let sender = self.model.send_packet(assoc_id, addr, u16::MAX as usize);
         for (header, frag) in sender.into_fragments(pkt.as_ref()) {
-            let mut send = self.conn.open_uni().await?;
-            header.async_marshal(&mut send).await?;
-            send.write_all(frag).await?;
-            send.finish().map_err(|e| Error::StreamClosed(e))?;
+            match &self.conn {
+                InnerConn::Quic(q) => {
+                    let mut send = SeaCoreWriteStream::Quic(q.open_uni().await?);
+                    header.async_marshal(&mut send).await?;
+                    send.write_all(frag).await?;
+                    match send {
+                        SeaCoreWriteStream::Quic(mut q) => q.finish().map_err(|e| Error::StreamClosed(e))?,
+                        SeaCoreWriteStream::Tcp(_) => {}
+                    }
+                }
+                InnerConn::Tcp(t) => {
+                    let mut tcp_lock = t.lock().await;
+                    header.async_marshal(&mut *tcp_lock).await?;
+                    tcp_lock.write_all(frag).await.map_err(|e| Error::Io(e))?;
+                }
+            }
         }
         Ok(())
     }
 
-    /// Sends a `Heartbeat` via QUIC datagram
-    pub fn heartbeat(&self) -> Result<(), Error> {
+    /// Sends a `Heartbeat` via QUIC datagram or TCP stream
+    pub async fn heartbeat(&self) -> Result<(), Error> {
         let header = self.model.send_heartbeat();
         let full_header = Header::Heartbeat(header);
         let mut buf = Vec::with_capacity(full_header.len());
         full_header.write(&mut buf);
-        self.conn.send_datagram(Bytes::from(buf))?;
+        match &self.conn {
+            InnerConn::Quic(q) => {
+                q.send_datagram(Bytes::from(buf))?;
+            }
+            InnerConn::Tcp(t) => {
+                let mut tcp_lock = t.lock().await;
+                tcp_lock.write_all(&buf).await.map_err(|e| Error::Io(e))?;
+            }
+        }
         Ok(())
     }
 
-    /// Sends a `Ping` via QUIC datagram
-    pub fn ping(&self, seq_id: u16, timestamp: u64) -> Result<(), Error> {
+    /// Sends a `Ping` via QUIC datagram or TCP stream
+    pub async fn ping(&self, seq_id: u16, timestamp: u64) -> Result<(), Error> {
         let header = self.model.send_ping(seq_id, timestamp);
         let full_header = Header::Ping(header);
         let mut buf = Vec::with_capacity(full_header.len());
         full_header.write(&mut buf);
-        self.conn.send_datagram(Bytes::from(buf))?;
+        match &self.conn {
+            InnerConn::Quic(q) => {
+                q.send_datagram(Bytes::from(buf))?;
+            }
+            InnerConn::Tcp(t) => {
+                let mut tcp_lock = t.lock().await;
+                tcp_lock.write_all(&buf).await.map_err(|e| Error::Io(e))?;
+            }
+        }
         Ok(())
     }
 
@@ -98,8 +144,11 @@ impl<Side> Connection<Side> {
         self.model.collect_garbage(timeout);
     }
 
-    fn keying_material_exporter(&self) -> KeyingMaterialExporter {
-        KeyingMaterialExporter(self.conn.clone())
+    fn keying_material_exporter(&self) -> Option<KeyingMaterialExporter> {
+        match &self.conn {
+            InnerConn::Quic(q) => Some(KeyingMaterialExporter(q.clone())),
+            InnerConn::Tcp(_) => None, // Handled manually for TCP fallback
+        }
     }
 }
 
@@ -107,7 +156,7 @@ impl<Side> Connection<Side> {
 
 impl Connection<side::Client> {
     /// Creates a new client-side connection
-    pub fn new(conn: QuinnConnection) -> Self {
+    pub fn new(conn: InnerConn) -> Self {
         Self {
             conn,
             model: ConnectionModel::new(),
@@ -115,37 +164,67 @@ impl Connection<side::Client> {
         }
     }
 
-    /// Sends an `Authenticate` command via uni-stream
+    /// Sends an `Authenticate` command via uni-stream or TCP
     pub async fn authenticate(&self, uuid: Uuid, password: impl AsRef<[u8]>) -> Result<(), Error> {
-        let header_data = self.model.send_authenticate(uuid, password, &self.keying_material_exporter());
-        let header = Header::Authenticate(header_data);
-        let mut send = self.conn.open_uni().await?;
-        header.async_marshal(&mut send).await?;
-        send.finish().map_err(|e| Error::StreamClosed(e))?;
+        let exporter_opt = self.keying_material_exporter();
+        let auth_data = self.model.send_authenticate(uuid, password, exporter_opt.as_ref()); 
+        let header = Header::Authenticate(auth_data);
+        match &self.conn {
+            InnerConn::Quic(q) => {
+                let mut send = SeaCoreWriteStream::Quic(q.open_uni().await?);
+                header.async_marshal(&mut send).await?;
+                if let SeaCoreWriteStream::Quic(mut inner) = send {
+                    inner.finish().map_err(|e| Error::StreamClosed(e))?;
+                }
+            }
+            InnerConn::Tcp(t) => {
+                let mut tcp_lock = t.lock().await;
+                header.async_marshal(&mut *tcp_lock).await?;
+            }
+        }
         Ok(())
     }
 
-    /// Sends a `Connect` command via bi-stream, returns the stream pair
+    /// Sends a `Connect` command via bi-stream (QUIC) or returns an error for TCP (TCP multiplexing not fully supported over single stream yet, requires new stream logic)
     pub async fn connect(&self, addr: Address) -> Result<BiStream, Error> {
         let header_data = self.model.send_connect(addr.clone());
         let header = Header::Connect(header_data);
-        let (mut send, recv) = self.conn.open_bi().await?;
-        header.async_marshal(&mut send).await?;
-        Ok(BiStream { send, recv })
+        match &self.conn {
+            InnerConn::Quic(q) => {
+                let (send, recv) = q.open_bi().await?;
+                let mut sc_send = SeaCoreWriteStream::Quic(send);
+                let sc_recv = SeaCoreReadStream::Quic(recv);
+                header.async_marshal(&mut sc_send).await?;
+                Ok(BiStream { send: sc_send, recv: sc_recv })
+            }
+            InnerConn::Tcp(_) => {
+                Err(Error::BadCommand("Connect over multiplexed TCP not yet supported natively in this interface".into()))
+            }
+        }
     }
 
     /// Sends a `Dissociate` command via uni-stream
     pub async fn dissociate(&self, assoc_id: u16) -> Result<(), Error> {
         let header_data = self.model.send_dissociate(assoc_id);
         let header = Header::Dissociate(header_data);
-        let mut send = self.conn.open_uni().await?;
-        header.async_marshal(&mut send).await?;
-        send.finish().map_err(|e| Error::StreamClosed(e))?;
+        match &self.conn {
+            InnerConn::Quic(q) => {
+                let mut send = SeaCoreWriteStream::Quic(q.open_uni().await?);
+                header.async_marshal(&mut send).await?;
+                if let SeaCoreWriteStream::Quic(mut inner) = send {
+                    inner.finish().map_err(|e| Error::StreamClosed(e))?;
+                }
+            }
+            InnerConn::Tcp(t) => {
+                let mut tcp_lock = t.lock().await;
+                header.async_marshal(&mut *tcp_lock).await?;
+            }
+        }
         Ok(())
     }
 
     /// Parse a uni-stream as a SeaCore command (Client side normally only receives Packets or Dissociate)
-    pub async fn accept_uni_stream(&self, mut recv: RecvStream) -> Result<Task, Error> {
+    pub async fn accept_uni_stream(&self, mut recv: SeaCoreReadStream) -> Result<Task, Error> {
         let header = Header::async_unmarshal(&mut recv)
             .await
             .map_err(|e| Error::UnmarshalStream(e))?;
@@ -162,13 +241,41 @@ impl Connection<side::Client> {
             other => Err(Error::BadCommand(format!("{} on uni_stream_client", other))),
         }
     }
+
+    /// Parse a continuous TCP stream as SeaCore commands
+    pub async fn next_tcp_task(&self, recv: &mut (dyn tokio::io::AsyncRead + Unpin + Send)) -> Result<Task, Error> {
+        let header = Header::async_unmarshal(recv)
+            .await
+            .map_err(|e| Error::UnmarshalStream(e))?;
+
+        match header {
+            Header::Packet(pkt) => {
+                let _model_pkt = self.model.recv_packet(pkt.clone());
+                use tokio::io::AsyncReadExt;
+                let size = pkt.size() as usize;
+                let mut buf = vec![0u8; size];
+                recv.read_exact(&mut buf).await.map_err(|e| Error::Io(e))?;
+                Ok(Task::Packet(PacketTask {
+                    header: pkt,
+                    source: PacketSource::Native(bytes::Bytes::from(buf)),
+                }))
+            }
+            Header::Heartbeat(_) => Ok(Task::Heartbeat),
+            Header::Ping(ping) => Ok(Task::Ping {
+                seq_id: ping.seq_id(),
+                timestamp: ping.timestamp(),
+            }),
+            Header::Dissociate(diss) => Ok(Task::Dissociate(diss.assoc_id())),
+            other => Err(Error::BadCommand(format!("{} on next_tcp_task_client", other))),
+        }
+    }
 }
 
 // ── Server side ────────────────────────────────
 
 impl Connection<side::Server> {
     /// Creates a new server-side connection
-    pub fn new(conn: QuinnConnection) -> Self {
+    pub fn new(conn: InnerConn) -> Self {
         Self {
             conn,
             model: ConnectionModel::new(),
@@ -177,7 +284,7 @@ impl Connection<side::Server> {
     }
 
     /// Parse a uni-stream as a SeaCore command
-    pub async fn accept_uni_stream(&self, mut recv: RecvStream) -> Result<Task, Error> {
+    pub async fn accept_uni_stream(&self, mut recv: SeaCoreReadStream) -> Result<Task, Error> {
         let header = Header::async_unmarshal(&mut recv)
             .await
             .map_err(|e| Error::UnmarshalStream(e))?;
@@ -208,7 +315,7 @@ impl Connection<side::Server> {
     }
 
     /// Parse a bi-stream as a SeaCore command
-    pub async fn accept_bi_stream(&self, send: SendStream, mut recv: RecvStream) -> Result<Task, Error> {
+    pub async fn accept_bi_stream(&self, send: SeaCoreWriteStream, mut recv: SeaCoreReadStream) -> Result<Task, Error> {
         let header = Header::async_unmarshal(&mut recv)
             .await
             .map_err(|e| Error::UnmarshalStream(e))?;
@@ -231,7 +338,63 @@ impl Connection<side::Server> {
         token: [u8; 32],
         password: impl AsRef<[u8]>,
     ) -> bool {
-        self.model.validate_authenticate(uuid, timestamp, token, password, &self.keying_material_exporter())
+        let exporter_opt = self.keying_material_exporter();
+        self.model.validate_authenticate(
+            uuid,
+            timestamp,
+            token,
+            password,
+            exporter_opt.as_ref(),
+        )
+    }
+
+    /// Parse a continuous TCP stream as SeaCore commands
+    pub async fn next_tcp_task(&self, recv: &mut (dyn tokio::io::AsyncRead + Unpin + Send)) -> Result<Task, Error> {
+        let header = Header::async_unmarshal(recv)
+            .await
+            .map_err(|e| Error::UnmarshalStream(e))?;
+
+        match header {
+            Header::Authenticate(auth) => {
+                let exporter = self.keying_material_exporter();
+                Ok(Task::Authenticate(Authenticate {
+                    uuid: auth.uuid(),
+                    timestamp: auth.timestamp(),
+                    token: auth.token(),
+                    exporter,
+                }))
+            }
+            Header::Packet(pkt) => {
+                let _model_pkt = self.model.recv_packet(pkt.clone());
+                use tokio::io::AsyncReadExt;
+                let size = pkt.size() as usize;
+                let mut buf = vec![0u8; size];
+                recv.read_exact(&mut buf).await.map_err(|e| Error::Io(e))?;
+                Ok(Task::Packet(PacketTask {
+                    header: pkt,
+                    source: PacketSource::Native(bytes::Bytes::from(buf)),
+                }))
+            }
+            Header::Heartbeat(_) => Ok(Task::Heartbeat),
+            Header::Ping(ping) => Ok(Task::Ping {
+                seq_id: ping.seq_id(),
+                timestamp: ping.timestamp(),
+            }),
+            Header::Dissociate(dissoc) => {
+                self.model.recv_dissociate(dissoc.clone());
+                Ok(Task::Dissociate(dissoc.assoc_id()))
+            }
+            Header::Connect(conn) => {
+                let addr = conn.addr().clone();
+                // In TCP 1:1 mode, the BiStream is handled by the caller.
+                // We return empty placeholders for now.
+                Ok(Task::Connect(BiStream {
+                    send: SeaCoreWriteStream::Tcp(Box::new(tokio::io::sink())),
+                    recv: SeaCoreReadStream::Tcp(Box::new(tokio::io::empty())),
+                }, addr))
+            }
+            other => Err(Error::BadCommand(format!("{} on next_tcp_task_server", other))),
+        }
     }
 }
 
@@ -269,10 +432,60 @@ impl<Side> Connection<Side> {
 
 // ── Supporting types ───────────────────────────
 
+pub enum SeaCoreReadStream {
+    Quic(RecvStream),
+    Tcp(Box<dyn tokio::io::AsyncRead + Unpin + Send>),
+}
+
+impl AsyncRead for SeaCoreReadStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            SeaCoreReadStream::Quic(ref mut r) => Pin::new(r).poll_read(cx, buf),
+            SeaCoreReadStream::Tcp(ref mut r) => Pin::new(r).poll_read(cx, buf),
+        }
+    }
+}
+
+pub enum SeaCoreWriteStream {
+    Quic(SendStream),
+    Tcp(Box<dyn tokio::io::AsyncWrite + Unpin + Send>),
+}
+
+impl AsyncWrite for SeaCoreWriteStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            SeaCoreWriteStream::Quic(ref mut w) => Pin::new(w).poll_write(cx, buf).map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e)),
+            SeaCoreWriteStream::Tcp(ref mut w) => Pin::new(w).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            SeaCoreWriteStream::Quic(ref mut w) => Pin::new(w).poll_flush(cx).map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e)),
+            SeaCoreWriteStream::Tcp(ref mut w) => Pin::new(w).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            SeaCoreWriteStream::Quic(ref mut w) => Pin::new(w).poll_shutdown(cx).map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e)),
+            SeaCoreWriteStream::Tcp(ref mut w) => Pin::new(w).poll_shutdown(cx),
+        }
+    }
+}
+
 /// A bidirectional stream for Connect commands
 pub struct BiStream {
-    pub send: SendStream,
-    pub recv: RecvStream,
+    pub send: SeaCoreWriteStream,
+    pub recv: SeaCoreReadStream,
 }
 
 impl AsyncRead for BiStream {
@@ -298,7 +511,7 @@ pub struct Authenticate {
     pub uuid: Uuid,
     pub timestamp: u64,
     pub token: [u8; 32],
-    exporter: KeyingMaterialExporter,
+    exporter: Option<KeyingMaterialExporter>,
 }
 
 impl Authenticate {
@@ -321,8 +534,13 @@ impl Authenticate {
         hasher.update(&self.timestamp.to_be_bytes());
         let context = hasher.finalize();
 
-        let expected = self.exporter.export_keying_material(self.uuid.as_bytes(), &context);
-        self.token == expected
+        if let Some(exp) = &self.exporter {
+            let expected = exp.export_keying_material(self.uuid.as_bytes(), &context);
+            self.token == expected
+        } else {
+            // Over TCP, auth is already handled by TLS ClientHello hijacking
+            true
+        }
     }
 }
 
@@ -332,8 +550,8 @@ pub struct PacketTask {
     source: PacketSource,
 }
 
-enum PacketSource {
-    Quic(RecvStream),
+pub enum PacketSource {
+    Quic(SeaCoreReadStream),
     Native(Bytes),
 }
 
@@ -368,11 +586,16 @@ impl PacketTask {
             PacketSource::Native(data) => Ok(data),
             PacketSource::Quic(mut recv) => {
                 let mut buf = vec![0u8; self.header.size() as usize];
-                recv.read_exact(&mut buf).await.map_err(|e| Error::ReadExact(e))?;
+                req_ext_read_exact(&mut recv, &mut buf).await?;
                 Ok(Bytes::from(buf))
             }
         }
     }
+}
+
+async fn req_ext_read_exact<T: AsyncRead + Unpin>(mut stream: T, buf: &mut [u8]) -> Result<(), Error> {
+    tokio::io::AsyncReadExt::read_exact(&mut stream, buf).await?;
+    Ok(())
 }
 
 /// Types of task that can be received from the QUIC connection

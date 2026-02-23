@@ -1,5 +1,6 @@
 use std::io::{self, Cursor, Read};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use tokio::io::AsyncReadExt;
 
 
 use thiserror::Error;
@@ -46,8 +47,8 @@ impl Header {
     }
 
     /// Async unmarshal from an AsyncRead source (for streams)
-    pub async fn async_unmarshal(
-        reader: &mut (impl tokio::io::AsyncReadExt + Unpin),
+    pub async fn async_unmarshal<R: tokio::io::AsyncRead + Unpin + ?Sized>(
+        reader: &mut R,
     ) -> Result<Self, UnmarshalError> {
         let mut buf = [0u8; 2];
         reader.read_exact(&mut buf).await?;
@@ -81,8 +82,8 @@ impl Authenticate {
         Ok(Self::new(Uuid::from_bytes(uuid_buf), u64::from_be_bytes(time_buf), token_buf))
     }
 
-    async fn async_unmarshal(
-        reader: &mut (impl tokio::io::AsyncReadExt + Unpin),
+    async fn async_unmarshal<R: tokio::io::AsyncRead + Unpin + ?Sized>(
+        reader: &mut R,
     ) -> Result<Self, UnmarshalError> {
         let mut uuid_buf = [0u8; 16];
         let mut time_buf = [0u8; 8];
@@ -100,8 +101,8 @@ impl Connect {
         Ok(Self::new(addr))
     }
 
-    async fn async_unmarshal(
-        reader: &mut (impl tokio::io::AsyncReadExt + Unpin),
+    async fn async_unmarshal<R: tokio::io::AsyncRead + Unpin + ?Sized>(
+        reader: &mut R,
     ) -> Result<Self, UnmarshalError> {
         let addr = Address::async_unmarshal(reader).await?;
         Ok(Self::new(addr))
@@ -121,8 +122,8 @@ impl Packet {
         Ok(Self::new(assoc_id, pkt_id, frag_total, frag_id, size, addr))
     }
 
-    async fn async_unmarshal(
-        reader: &mut (impl tokio::io::AsyncReadExt + Unpin),
+    async fn async_unmarshal<R: tokio::io::AsyncRead + Unpin + ?Sized>(
+        reader: &mut R,
     ) -> Result<Self, UnmarshalError> {
         let mut buf = [0u8; 8];
         reader.read_exact(&mut buf).await?;
@@ -143,8 +144,8 @@ impl Dissociate {
         Ok(Self::new(u16::from_be_bytes(buf)))
     }
 
-    async fn async_unmarshal(
-        reader: &mut (impl tokio::io::AsyncReadExt + Unpin),
+    async fn async_unmarshal<R: tokio::io::AsyncRead + Unpin + ?Sized>(
+        reader: &mut R,
     ) -> Result<Self, UnmarshalError> {
         let mut buf = [0u8; 2];
         reader.read_exact(&mut buf).await?;
@@ -161,8 +162,8 @@ impl Ping {
         Ok(Self::new(seq_id, timestamp))
     }
 
-    async fn async_unmarshal(
-        reader: &mut (impl tokio::io::AsyncReadExt + Unpin),
+    async fn async_unmarshal<R: tokio::io::AsyncRead + Unpin + ?Sized>(
+        reader: &mut R,
     ) -> Result<Self, UnmarshalError> {
         let mut buf = [0u8; 10];
         reader.read_exact(&mut buf).await?;
@@ -219,8 +220,8 @@ impl Address {
         }
     }
 
-    pub async fn async_unmarshal(
-        reader: &mut (impl tokio::io::AsyncReadExt + Unpin),
+    pub async fn async_unmarshal<R: tokio::io::AsyncRead + Unpin + ?Sized>(
+        reader: &mut R,
     ) -> Result<Self, UnmarshalError> {
         let mut type_buf = [0u8; 1];
         reader.read_exact(&mut type_buf).await?;

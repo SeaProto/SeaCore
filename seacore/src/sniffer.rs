@@ -498,3 +498,108 @@ pub fn verify_reality_auth(
     tracing::debug!("verify_reality_auth: hmac verify failed");
     None
 }
+
+/// Verifies Reality Auth via X25519 KeyShare and HMAC Timestamp SessionID Injection 
+/// for raw TCP TLS 1.3 connections. The `tcp_payload` is expected to be a TLS Record
+/// containing a Handshake containing a ClientHello message.
+pub fn verify_tcp_reality_auth(
+    tcp_payload: &[u8],
+    server_priv_key: &[u8; 32],
+    users: &[crate::server::UserConfig],
+    _short_ids: &[String],
+    server_names: &[String],
+) -> Option<[u8; 32]> {
+    // 1. Basic TLS Record Layer check
+    // ContentType: Handshake (22 or 0x16)
+    // Version: Legacy Record Version (0x03 0x01 or 0x03 0x03 usually)
+    // Length: 2 bytes
+    if tcp_payload.len() < 5 || tcp_payload[0] != 0x16 {
+        tracing::debug!("verify_tcp_reality_auth: not a TLS handshake record");
+        return None;
+    }
+    let record_len = u16::from_be_bytes([tcp_payload[3], tcp_payload[4]]) as usize;
+    if 5 + record_len > tcp_payload.len() {
+        tracing::debug!("verify_tcp_reality_auth: incomplete TLS record");
+        return None;
+    }
+
+    // Extract the Handshake message (which should be the ClientHello)
+    let ch = &tcp_payload[5..5 + record_len];
+
+    let (session_id, key_share) = match parse_client_hello(ch) {
+        Some((s, k)) => (s, k),
+        None => {
+            tracing::debug!("verify_tcp_reality_auth: parse_client_hello failed");
+            return None;
+        }
+    };
+    
+    // Validate SNI against configured server_names (soft check: missing SNI is OK)
+    if !server_names.is_empty() {
+        if let Some(sni) = parse_sni(ch) {
+            if !server_names.iter().any(|n| n == &sni) {
+                tracing::debug!("verify_tcp_reality_auth: SNI '{}' not in whitelist", sni);
+                return None;
+            }
+        }
+    }
+    
+    // We expect a 32 byte SessionID (Reality Token) and a 32 byte X25519 ephemeral public key
+    if session_id.len() != 32 || key_share.len() != 32 {
+        tracing::debug!("verify_tcp_reality_auth: invalid len, session_id {}, key_share {}", session_id.len(), key_share.len());
+        return None;
+    }
+
+    use x25519_dalek::{StaticSecret, PublicKey};
+    let mut priv_bytes = [0u8; 32];
+    priv_bytes.copy_from_slice(server_priv_key);
+    let static_sec = StaticSecret::from(priv_bytes);
+    
+    let mut peer_pub_bytes = [0u8; 32];
+    peer_pub_bytes.copy_from_slice(&key_share);
+    let peer_pub = PublicKey::from(peer_pub_bytes);
+
+    // Compute original shared secret using Client's Ephemeral Key and Server's Identity Key
+    let shared_secret = static_sec.diffie_hellman(&peer_pub);
+
+    // 0..8 = timestamp, 8..32 = HMAC(SharedSecret, Timestamp + UUID)
+    let mut ts_bytes = [0u8; 8];
+    ts_bytes.copy_from_slice(&session_id[0..8]);
+    let ts = u64::from_be_bytes(ts_bytes);
+
+    // Replay Protection: Token is valid for +/- 30 seconds
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if now > ts + 30 || now < ts.saturating_sub(30) {
+        tracing::debug!("verify_tcp_reality_auth: timestamp failed. now {}, ts {}", now, ts);
+        return None;
+    }
+
+    use ring::hmac;
+    let hm_key = hmac::Key::new(hmac::HMAC_SHA256, shared_secret.as_bytes());
+
+    for user in users {
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&ts.to_be_bytes());
+        msg.extend_from_slice(user.uuid.as_bytes());
+        let expected_tag = hmac::sign(&hm_key, &msg);
+        
+        // Constant-time compare 24-byte truncate tag
+        #[allow(deprecated)]
+        if ring::constant_time::verify_slices_are_equal(
+            &expected_tag.as_ref()[..24],
+            &session_id[8..32],
+        ).is_ok() {
+            tracing::info!("verify_tcp_reality_auth: SUCCESS for user {}", user.uuid);
+            let mut token = [0u8; 32];
+            token.copy_from_slice(&session_id);
+            return Some(token);
+        }
+    }
+
+    tracing::debug!("verify_tcp_reality_auth: hmac verify failed");
+    None
+}

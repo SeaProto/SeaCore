@@ -57,7 +57,7 @@ where
         &self,
         uuid: Uuid,
         password: impl AsRef<[u8]>,
-        exporter: &impl KeyingMaterialExporter,
+        exporter: Option<&impl KeyingMaterialExporter>,
     ) -> AuthenticateHeader {
         use sha2::{Sha256, Digest};
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -67,13 +67,17 @@ where
             .unwrap_or_default()
             .as_secs();
 
-        let context = {
-            let mut hasher = Sha256::new();
-            hasher.update(password.as_ref());
-            hasher.update(&timestamp.to_be_bytes());
-            hasher.finalize()
+        let token = if let Some(exp) = exporter {
+            let context = {
+                let mut hasher = Sha256::new();
+                hasher.update(password.as_ref());
+                hasher.update(&timestamp.to_be_bytes());
+                hasher.finalize()
+            };
+            exp.export_keying_material(uuid.as_bytes(), &context)
+        } else {
+            [0u8; 32] // TCP placeholder token
         };
-        let token = exporter.export_keying_material(uuid.as_bytes(), &context);
         AuthenticateHeader::new(uuid, timestamp, token)
     }
 
@@ -83,7 +87,7 @@ where
         timestamp: u64,
         token: [u8; 32],
         password: impl AsRef<[u8]>,
-        exporter: &impl KeyingMaterialExporter,
+        exporter: Option<&impl KeyingMaterialExporter>,
     ) -> bool {
         use sha2::{Sha256, Digest};
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -98,14 +102,18 @@ where
             return false;
         }
 
-        let context = {
-            let mut hasher = Sha256::new();
-            hasher.update(password.as_ref());
-            hasher.update(&timestamp.to_be_bytes());
-            hasher.finalize()
-        };
-        let expected = exporter.export_keying_material(uuid.as_bytes(), &context);
-        token == expected
+        if let Some(exp) = exporter {
+            let context = {
+                let mut hasher = Sha256::new();
+                hasher.update(password.as_ref());
+                hasher.update(&timestamp.to_be_bytes());
+                hasher.finalize()
+            };
+            let expected = exp.export_keying_material(uuid.as_bytes(), &context);
+            token == expected
+        } else {
+            true // Over TCP, auth is already handled by TLS ClientHello hijacking or manual logic
+        }
     }
 
     // ── Connect ───────────────────────────────────

@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::collections::HashMap;
 use tokio::sync::Mutex;
+use tokio::io::{AsyncWriteExt, AsyncReadExt};
 
 use eyre::Result;
 use quinn::Endpoint;
@@ -64,7 +65,9 @@ pub async fn run_server(config_path: &str) -> Result<()> {
     let mut server_crypto = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert_der], key_der)?;
-    server_crypto.alpn_protocols = vec![b"h3".to_vec()];
+    server_crypto.alpn_protocols = vec![b"h3".to_vec(), b"h2".to_vec(), b"http/1.1".to_vec()];
+
+    let server_crypto_clone = server_crypto.clone();
 
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)?,
@@ -146,18 +149,90 @@ pub async fn run_server(config_path: &str) -> Result<()> {
             }
         });
         
-        // --- Phase 15: Pure Transparent TCP Fallback ---
+        // --- Phase 19: TCP REALITY Proxy Channel & Fallback ---
         let tcp_listen_addr = config.listen;
         let dest_str = reality.dest.clone();
+        
+        let mut server_priv_key_copy = [0u8; 32];
+        let priv_b64 = reality.private_key.as_str();
+        if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(priv_b64) {
+            if decoded.len() == 32 {
+                server_priv_key_copy.copy_from_slice(&decoded);
+            }
+        }
+        let users_clone = config.users.clone();
+        let short_ids_clone = reality.short_ids.clone();
+        let server_names_clone = reality.server_names.clone();
+
+        let config_clone_for_tcp = config.clone();
+
         tokio::spawn(async move {
             match tokio::net::TcpListener::bind(tcp_listen_addr).await {
                 Ok(listener) => {
-                    info!("TCP Fallback Listener bound to {}", tcp_listen_addr);
+                    info!("TCP REALITY Listener bound to {}", tcp_listen_addr);
                     loop {
                         match listener.accept().await {
                             Ok((mut client_stream, client_addr)) => {
                                 let dest = dest_str.clone();
+                                let priv_key = server_priv_key_copy.clone();
+                                let users = users_clone.clone();
+                                let s_ids = short_ids_clone.clone();
+                                let s_names = server_names_clone.clone();
+                                let server_crypto_inner = server_crypto_clone.clone();
+                                let config_inner = config_clone_for_tcp.clone();
+
                                 tokio::spawn(async move {
+                                    // 1. Sniff the first few bytes to find the ClientHello
+                                    // A TLS ClientHello is typically within the first ~2KB.
+                                    // We read fixed chunks or just once with a timeout.
+                                    let mut buf = vec![0u8; 4096];
+                                    let mut read_len = 0;
+                                    
+                                    // Wait up to 3 seconds for the initial TLS handshake data
+                                    if let Ok(Ok(n)) = tokio::time::timeout(
+                                        std::time::Duration::from_secs(3),
+                                        client_stream.peek(&mut buf)
+                                    ).await {
+                                        read_len = n;
+                                    }
+
+                                    if read_len == 0 {
+                                        return; // Client closed or timeout, drop.
+                                    }
+
+                                    let initial_data = &buf[..read_len];
+
+                                    // 2. Try to verify Reality Auth
+                                    if let Some(_token) = crate::sniffer::verify_tcp_reality_auth(
+                                        initial_data,
+                                        &priv_key,
+                                        &users,
+                                        &s_ids,
+                                        &s_names,
+                                    ) {
+                                        info!("TCP REALITY Authentication SUCCESS from {} (Routing)", client_addr);
+                                        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_crypto_inner));
+                                        match acceptor.accept(client_stream).await {
+                                            Ok(tls_stream) => {
+                                                let (r, w) = tokio::io::split(tls_stream);
+                                                let inner = seacore_protocol::quic::InnerConn::Tcp(std::sync::Arc::new(tokio::sync::Mutex::new(Box::new(w))));
+                                                let seacore_conn = seacore_protocol::quic::Connection::<seacore_protocol::quic::side::Server>::new(inner);
+                                                let config_for_tcp = config_inner;
+
+                                                tokio::spawn(async move {
+                                                    if let Err(e) = handle_tcp_connection(seacore_conn, Box::new(r), config_for_tcp).await {
+                                                        warn!("TCP connection error handling failed: {}", e);
+                                                    }
+                                                });
+                                            }
+                                            Err(e) => {
+                                                warn!("TCP REALITY Server TLS Accept failed: {}", e);
+                                            }
+                                        }
+                                        return;
+                                    }
+
+                                    // 3. Fallback: Authentication failed, proxy transparently to dest
                                     if let Ok(mut fallback_addrs) = tokio::net::lookup_host(&dest).await {
                                         if let Some(target_addr) = fallback_addrs.next() {
                                             match tokio::net::TcpStream::connect(target_addr).await {
@@ -180,13 +255,13 @@ pub async fn run_server(config_path: &str) -> Result<()> {
                                 });
                             }
                             Err(e) => {
-                                warn!("TCP Fallback Listener accept error: {}", e);
+                                warn!("TCP REALITY Listener accept error: {}", e);
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    error!("TCP Fallback: Failed to bind to {}: {}", tcp_listen_addr, e);
+                    error!("TCP REALITY: Failed to bind to {}: {}", tcp_listen_addr, e);
                 }
             }
         });
@@ -222,13 +297,13 @@ pub struct UdpAssoc {
 }
 
 async fn handle_connection(conn: quinn::Connection, config: ServerConfig) -> Result<()> {
-    let seacore_conn = Connection::<side::Server>::new(conn.clone());
+    let seacore_conn = Connection::<side::Server>::new(seacore_protocol::quic::InnerConn::Quic(conn.clone()));
     let conn_for_streams = conn.clone();
 
     // 1. Wait up to 5 seconds for Authenticate command on a uni-stream
     let auth_success = match tokio::time::timeout(std::time::Duration::from_secs(5), async {
         if let Ok(recv) = conn_for_streams.accept_uni().await {
-            if let Ok(Task::Authenticate(auth)) = seacore_conn.accept_uni_stream(recv).await {
+            if let Ok(Task::Authenticate(auth)) = seacore_conn.accept_uni_stream(seacore_protocol::quic::SeaCoreReadStream::Quic(recv)).await {
                 let uuid = auth.uuid;
                 if let Some(user) = config.users.iter().find(|u| u.uuid == uuid) {
                     if auth.validate(&user.password) {
@@ -308,7 +383,7 @@ async fn handle_connection(conn: quinn::Connection, config: ServerConfig) -> Res
                         let _config = config.clone();
                         let udp_assocs = udp_assocs.clone();
                         tokio::spawn(async move {
-                            match seacore_conn.accept_uni_stream(recv).await {
+                            match seacore_conn.accept_uni_stream(seacore_protocol::quic::SeaCoreReadStream::Quic(recv)).await {
                                 Ok(Task::Authenticate(_auth)) => {
                                     warn!("Received redundant or delayed Authenticate command");
                                 }
@@ -349,7 +424,10 @@ async fn handle_connection(conn: quinn::Connection, config: ServerConfig) -> Res
                     Ok((send, recv)) => {
                         let seacore_conn = seacore_conn.clone();
                         tokio::spawn(async move {
-                            match seacore_conn.accept_bi_stream(send, recv).await {
+                            match seacore_conn.accept_bi_stream(
+                                seacore_protocol::quic::SeaCoreWriteStream::Quic(send),
+                                seacore_protocol::quic::SeaCoreReadStream::Quic(recv)
+                            ).await {
                                 Ok(Task::Connect(stream, addr)) => {
                                     info!("TCP connect request to {}", addr);
                                     let target_addr_str = match addr {
@@ -427,7 +505,7 @@ async fn handle_server_udp_packet(
                             let data = &buf[..size];
                             let seacore_addr = Address::SocketAddress(peer_addr);
                             // We use packet_quic as a default reliable relay back, or datagram for speed
-                            if let Err(e) = seacore_conn.packet_native(data, seacore_addr, assoc_id) {
+                            if let Err(e) = seacore_conn.packet_native(data, seacore_addr, assoc_id).await {
                                 warn!("Failed to send UDP reply back to client: {}", e);
                             }
                         }
@@ -449,6 +527,116 @@ async fn handle_server_udp_packet(
 
     // Note: for DomainAddress, tokio UdpSocket send_to handles resolving the domain internally!
     socket.send_to(&payload, target_addr_str).await?;
+    Ok(())
+}
+
+async fn handle_tcp_connection(
+    seacore_conn: Connection<side::Server>,
+    mut recv: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+    config: ServerConfig,
+) -> Result<()> {
+    info!("Starting SeaCore TCP Connection Handler");
+    
+    // Auth timeout loop
+    let auth_success = match tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        if let Ok(Task::Authenticate(auth)) = seacore_conn.next_tcp_task(recv.as_mut()).await {
+            let uuid = auth.uuid;
+            if let Some(user) = config.users.iter().find(|u| u.uuid == uuid) {
+                if auth.validate(&user.password) {
+                    return true;
+                } else {
+                    warn!("TCP Invalid token for user {}", uuid);
+                }
+            } else {
+                warn!("TCP Unknown user {}", uuid);
+            }
+        }
+        false
+    }).await {
+        Ok(res) => res,
+        Err(_) => false,
+    };
+
+    if !auth_success {
+        warn!("TCP connection authentication failed. Closing.");
+        return Ok(());
+    }
+
+    info!("User authenticated via TCP");
+
+    let udp_assocs: Arc<tokio::sync::Mutex<HashMap<u16, UdpAssoc>>> = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    
+    // Process remaining packets sequentially
+    loop {
+        match seacore_conn.next_tcp_task(recv.as_mut()).await {
+            Ok(Task::Packet(pkt)) => {
+                let assoc_id = pkt.assoc_id();
+                let addr = pkt.addr().clone();
+                let udp_assocs_clone = udp_assocs.clone();
+                let seacore_conn_clone = seacore_conn.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_server_udp_packet(pkt, addr, assoc_id, udp_assocs_clone, seacore_conn_clone).await {
+                        warn!("TCP UDP packet handling error: {}", e);
+                    }
+                });
+            }
+            Ok(Task::Connect(_bistream, addr)) => {
+                info!("TCP CONNECT request over authenticated Reality connection to {}", addr);
+                let target_addr_str = match &addr {
+                    Address::SocketAddress(sa) => sa.to_string(),
+                    Address::DomainAddress(domain, port) => format!("{}:{}", domain, port),
+                    Address::None => continue,
+                };
+
+                match tokio::net::TcpStream::connect(&target_addr_str).await {
+                    Ok(mut target_stream) => {
+                        let (mut target_ri, mut target_wi) = target_stream.split();
+                        let client_to_target = tokio::io::copy(&mut recv, &mut target_wi);
+                        
+                        let writer_conn = seacore_conn.conn.clone();
+                        let target_to_client = async move {
+                            let mut target_ri = target_ri;
+                            let mut buf = vec![0u8; 8192];
+                            loop {
+                                let n = target_ri.read(&mut buf).await?;
+                                if n == 0 { break; }
+                                if let seacore_protocol::quic::InnerConn::Tcp(t) = &writer_conn {
+                                    let mut w = t.lock().await;
+                                    w.write_all(&buf[..n]).await?;
+                                } else {
+                                    break;
+                                }
+                            }
+                            Ok::<(), std::io::Error>(())
+                        };
+                        
+                        let _ = tokio::try_join!(client_to_target, target_to_client);
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        warn!("TCP CONNECT: Failed to connect to {}: {}", target_addr_str, e);
+                        return Ok(());
+                    }
+                }
+            }
+            Ok(Task::Dissociate(assoc_id)) => {
+                let mut assocs = udp_assocs.lock().await;
+                if let Some(assoc) = assocs.remove(&assoc_id) {
+                    assoc.task.abort();
+                }
+            }
+            Ok(Task::Heartbeat) => {}
+            Ok(Task::Ping { seq_id, timestamp }) => {
+                let _ = seacore_conn.ping(seq_id, timestamp).await;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                info!("TCP connection closed: {}", e);
+                break;
+            }
+        }
+    }
+    
     Ok(())
 }
 
