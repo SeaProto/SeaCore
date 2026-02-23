@@ -2,13 +2,13 @@ use std::fs;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::collections::HashMap;
-use tokio::sync::Mutex;
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
+use parking_lot::Mutex;
 
 use eyre::Result;
 use quinn::Endpoint;
 use serde::Deserialize;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use seacore_protocol::protocol::Address;
@@ -173,7 +173,8 @@ pub async fn run_server(config_path: &str) -> Result<()> {
                     loop {
                         match listener.accept().await {
                             Ok((mut client_stream, client_addr)) => {
-                                let dest = dest_str.clone();
+                            debug!("TCP connection received from {}", client_addr);
+                            let dest = dest_str.clone();
                                 let priv_key = server_priv_key_copy.clone();
                                 let users = users_clone.clone();
                                 let s_ids = short_ids_clone.clone();
@@ -241,10 +242,8 @@ pub async fn run_server(config_path: &str) -> Result<()> {
                                                     let (mut client_ri, mut client_wi) = client_stream.split();
                                                     let (mut target_ri, mut target_wi) = target_stream.split();
                                                     
-                                                    let client_to_target = tokio::io::copy(&mut client_ri, &mut target_wi);
-                                                    let target_to_client = tokio::io::copy(&mut target_ri, &mut client_wi);
-                                                    
-                                                    let _ = tokio::try_join!(client_to_target, target_to_client);
+                                                    let _ = tokio::io::copy(&mut client_ri, &mut target_wi);
+                                                    let _ = tokio::io::copy(&mut target_ri, &mut client_wi);
                                                 }
                                                 Err(e) => {
                                                     warn!("TCP Fallback: Failed to connect to {} for client {}: {}", target_addr, client_addr, e);
@@ -256,6 +255,7 @@ pub async fn run_server(config_path: &str) -> Result<()> {
                             }
                             Err(e) => {
                                 warn!("TCP REALITY Listener accept error: {}", e);
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                             }
                         }
                     }
@@ -292,8 +292,9 @@ pub async fn run_server(config_path: &str) -> Result<()> {
 }
 
 pub struct UdpAssoc {
-    socket: Arc<tokio::net::UdpSocket>,
-    task: tokio::task::JoinHandle<()>,
+    pub socket: Arc<tokio::net::UdpSocket>,
+    pub tx: tokio::sync::mpsc::Sender<(bytes::Bytes, Address)>,
+    pub task: tokio::task::JoinHandle<()>,
 }
 
 async fn handle_connection(conn: quinn::Connection, config: ServerConfig) -> Result<()> {
@@ -380,35 +381,27 @@ async fn handle_connection(conn: quinn::Connection, config: ServerConfig) -> Res
                 match uni {
                     Ok(recv) => {
                         let seacore_conn = seacore_conn.clone();
-                        let _config = config.clone();
-                        let udp_assocs = udp_assocs.clone();
+                        let seacore_conn_clone = seacore_conn.clone();
+                        let udp_assocs_clone = udp_assocs.clone();
                         tokio::spawn(async move {
-                            match seacore_conn.accept_uni_stream(seacore_protocol::quic::SeaCoreReadStream::Quic(recv)).await {
-                                Ok(Task::Authenticate(_auth)) => {
-                                    warn!("Received redundant or delayed Authenticate command");
-                                }
-                                Ok(Task::Dissociate(assoc_id)) => {
-                                    info!("Dissociate UDP session {}", assoc_id);
-                                    let mut assocs = udp_assocs.lock().await;
-                                    if let Some(assoc) = assocs.remove(&assoc_id) {
-                                        assoc.task.abort();
-                                    }
-                                }
-                                Ok(Task::Packet(pkt)) => {
-                                    let assoc_id = pkt.assoc_id();
-                                    let addr = pkt.addr().clone();
-                                    let udp_assocs = udp_assocs.clone();
-                                    let seacore_conn_clone = seacore_conn.clone();
-                                    tokio::spawn(async move {
-                                        if let Err(e) = handle_server_udp_packet(pkt, addr, assoc_id, udp_assocs, seacore_conn_clone).await {
+                            if let Ok(task) = seacore_conn_clone.accept_uni_stream(seacore_protocol::quic::SeaCoreReadStream::Quic(recv)).await {
+                                match task {
+                                    Task::Packet(pkt) => {
+                                        let assoc_id = pkt.assoc_id();
+                                        let addr = pkt.addr().clone();
+                                        if let Err(e) = handle_server_udp_packet(pkt, addr, assoc_id, udp_assocs_clone, seacore_conn_clone).await {
                                             warn!("UDP packet handling error: {}", e);
                                         }
-                                    });
+                                    }
+                                    Task::Dissociate(assoc_id) => {
+                                        info!("Dissociate UDP session {}", assoc_id);
+                                        let mut assocs = udp_assocs_clone.lock();
+                                        if let Some(assoc) = assocs.remove(&assoc_id) {
+                                            assoc.task.abort();
+                                        }
+                                    }
+                                    _ => {}
                                 }
-                                Ok(_) => {}
-                                // H3 SETTINGS/QPACK streams from client will fail to
-                                // parse as SeaCore protocol — silently ignore them
-                                Err(_) => {}
                             }
                         });
                     }
@@ -478,9 +471,7 @@ async fn handle_server_udp_packet(
     udp_assocs: Arc<Mutex<HashMap<u16, UdpAssoc>>>,
     seacore_conn: Connection<side::Server>,
 ) -> Result<()> {
-    let payload: bytes::Bytes = pkt.payload().await?;
-    
-    let target_addr_str = match &addr {
+    let _target_addr_str = match &addr {
         Address::SocketAddress(sa) => sa.to_string(),
         Address::DomainAddress(domain, port) => format!("{}:{}", domain, port),
         Address::None => {
@@ -488,45 +479,70 @@ async fn handle_server_udp_packet(
         }
     };
 
-    let socket = {
-        let mut assocs = udp_assocs.lock().await;
-        if let Some(assoc) = assocs.get(&assoc_id) {
-            assoc.socket.clone()
-        } else {
-            // Determine if we should bind IPv4 or IPv6 based on the target config? 0.0.0.0 is usually fine
-            let socket = Arc::new(tokio::net::UdpSocket::bind("0.0.0.0:0").await?);
-            let socket_clone = socket.clone();
-            
-            let task = tokio::spawn(async move {
-                let mut buf = vec![0u8; 65536];
-                loop {
-                    match socket_clone.recv_from(&mut buf).await {
-                        Ok((size, peer_addr)) => {
-                            let data = &buf[..size];
-                            let seacore_addr = Address::SocketAddress(peer_addr);
-                            // We use packet_quic as a default reliable relay back, or datagram for speed
-                            if let Err(e) = seacore_conn.packet_native(data, seacore_addr, assoc_id).await {
-                                warn!("Failed to send UDP reply back to client: {}", e);
-                            }
+    let tx_opt = {
+        let assocs = udp_assocs.lock();
+        assocs.get(&assoc_id).map(|a| a.tx.clone())
+    };
+
+    let tx = if let Some(tx) = tx_opt {
+        tx
+    } else {
+        let socket = Arc::new(tokio::net::UdpSocket::bind("0.0.0.0:0").await?);
+        let socket_clone = socket.clone();
+        
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(bytes::Bytes, Address)>(100);
+        let tx_clone = tx.clone();
+        let _tx_clone = tx_clone; // Suppress unused for now if not needed
+        let seacore_conn_inner = seacore_conn.clone();
+        let udp_assocs_inner = udp_assocs.clone();
+        
+        let task = tokio::spawn(async move {
+            let mut buf = [0u8; 65535];
+            loop {
+                tokio::select! {
+                    Some((payload, target)) = rx.recv() => {
+                        let target_addr_str = match target {
+                            Address::SocketAddress(sa) => sa.to_string(),
+                            Address::DomainAddress(domain, port) => format!("{}:{}", domain, port),
+                            Address::None => continue,
+                        };
+                        if let Err(e) = socket_clone.send_to(&payload, target_addr_str).await {
+                            warn!("UDP target send error: {}", e);
                         }
-                        Err(e) => {
-                            warn!("UDP recv_from error for assoc {}: {}", assoc_id, e);
-                            break;
+                    }
+                    res = socket_clone.recv_from(&mut buf) => {
+                        match res {
+                            Ok((len, src_addr)) => {
+                                let _ = seacore_conn_inner.packet_native(&buf[..len], Address::SocketAddress(src_addr), assoc_id).await;
+                            }
+                            Err(e) => {
+                                warn!("UDP target recv error: {}", e);
+                                break;
+                            }
                         }
                     }
                 }
-            });
-            
+            }
+            let mut assocs = udp_assocs_inner.lock();
+            assocs.remove(&assoc_id);
+        });
+
+        let mut assocs = udp_assocs.lock();
+        // Double check
+        if let Some(existing) = assocs.get(&assoc_id) {
+            existing.tx.clone()
+        } else {
             assocs.insert(assoc_id, UdpAssoc {
                 socket: socket.clone(),
+                tx: tx.clone(),
                 task,
             });
-            socket
+            tx
         }
     };
 
-    // Note: for DomainAddress, tokio UdpSocket send_to handles resolving the domain internally!
-    socket.send_to(&payload, target_addr_str).await?;
+    let payload: bytes::Bytes = pkt.payload().await?;
+    let _ = tx.send((payload, addr)).await;
     Ok(())
 }
 
@@ -562,9 +578,9 @@ async fn handle_tcp_connection(
         return Ok(());
     }
 
-    info!("User authenticated via TCP");
+    info!("User authenticated via TCP"); // This line was cut off in the diff, assuming it was just a formatting issue.
 
-    let udp_assocs: Arc<tokio::sync::Mutex<HashMap<u16, UdpAssoc>>> = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let udp_assocs: Arc<Mutex<HashMap<u16, UdpAssoc>>> = Arc::new(Mutex::new(HashMap::new())); // Changed to parking_lot::Mutex
     
     // Process remaining packets sequentially
     loop {
@@ -590,7 +606,7 @@ async fn handle_tcp_connection(
 
                 match tokio::net::TcpStream::connect(&target_addr_str).await {
                     Ok(mut target_stream) => {
-                        let (mut target_ri, mut target_wi) = target_stream.split();
+                        let (target_ri, mut target_wi) = target_stream.split();
                         let client_to_target = tokio::io::copy(&mut recv, &mut target_wi);
                         
                         let writer_conn = seacore_conn.conn.clone();
@@ -620,7 +636,7 @@ async fn handle_tcp_connection(
                 }
             }
             Ok(Task::Dissociate(assoc_id)) => {
-                let mut assocs = udp_assocs.lock().await;
+                let mut assocs = udp_assocs.lock();
                 if let Some(assoc) = assocs.remove(&assoc_id) {
                     assoc.task.abort();
                 }

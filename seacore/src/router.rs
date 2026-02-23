@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
+use parking_lot::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::sniffer;
@@ -91,26 +91,32 @@ impl QuicRouter {
                 Ok(res) => res,
                 Err(e) => {
                     warn!("Router recv_from error: {}", e);
+                    // Add a small sleep to prevent busy loop on some error types
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                     continue;
                 }
             };
 
             let packet = &buf[..len];
-            let mut sessions = self.sessions.lock().await;
 
-            // Check if existing session
-            if let Some(target) = sessions.get(&client_addr) {
-                let sock = match target {
-                    SessionTarget::SeaCore(s) => s,
-                    SessionTarget::Fallback(s) => s,
-                };
+            // 1. Fast path: Optimistic session lookup
+            let existing_sock = {
+                let sessions = self.sessions.lock();
+                sessions.get(&client_addr).map(|t| match t {
+                    SessionTarget::SeaCore(s) => s.clone(),
+                    SessionTarget::Fallback(s) => s.clone(),
+                })
+            };
+
+            if let Some(sock) = existing_sock {
                 if let Err(e) = sock.send(packet).await {
                     warn!("Failed to forward packet for existing session {}: {}", client_addr, e);
                 }
                 continue;
             }
 
-            // New session, inspect QUIC Initial packet
+            // 2. Slow path: New session.
+            // Move sniffer out of the lock!
             let auth_result = sniffer::verify_reality_auth(
                 packet,
                 &self.server_priv_key,
@@ -121,7 +127,7 @@ impl QuicRouter {
 
             let is_valid = if let Some(token) = auth_result {
                 // Check replay cache
-                let mut cache = self.replay_cache.lock().await;
+                let mut cache = self.replay_cache.lock();
                 if cache.check_and_insert(token) {
                     warn!("Replay attack detected from {}, rejecting", client_addr);
                     false
@@ -129,34 +135,39 @@ impl QuicRouter {
                     true
                 }
             } else {
-                // If it's not a valid initial Auth packet, it might be an ongoing connection 
-                // from before a server restart (short header packet).
-                // Let's forward short headers to Quinn so Quinn can issue a Stateless Reset.
-                // A short header in QUIC v1 starts with a 0 bit (so 0x80 bit is not set).
+                // Short header check for stateless resets
                 if !packet.is_empty() && (packet[0] & 0x80) == 0 {
-                    true // send to Quinn for stateless reset
+                    true
                 } else {
                     false
                 }
             };
 
             let target_addr = if is_valid {
-                info!("Reality QUIC Auth successful for {}", client_addr);
                 self.quinn_addr
             } else {
-                info!("Reality QUIC Auth failed for {}, routing to fallback", client_addr);
                 self.fallback_addr
             };
 
-            // Create a dedicated local socket for this client to ensure quinn replies uniquely
-            // Bind to matching address family (IPv4 or IPv6) based on the target
+            // Bind socket OUTSIDE the sessions lock
             let bind_addr: SocketAddr = if target_addr.is_ipv6() {
                 "[::]:0".parse().expect("constant addr")
             } else {
                 "0.0.0.0:0".parse().expect("constant addr")
             };
-            let local_sock = Arc::new(UdpSocket::bind(bind_addr).await?);
-            local_sock.connect(target_addr).await?;
+            
+            let local_sock: Arc<UdpSocket> = match UdpSocket::bind(bind_addr).await {
+                Ok(s) => Arc::new(s),
+                Err(e) => {
+                    warn!("Failed to bind relay socket: {}", e);
+                    continue;
+                }
+            };
+            
+            if let Err(e) = local_sock.connect(target_addr).await {
+                warn!("Failed to connect relay socket to {}: {}", target_addr, e);
+                continue;
+            }
             
             // Forward the first packet
             if let Err(e) = local_sock.send(packet).await {
@@ -164,13 +175,21 @@ impl QuicRouter {
                 continue;
             }
 
-            let session = if is_valid {
-                SessionTarget::SeaCore(local_sock.clone())
-            } else {
-                SessionTarget::Fallback(local_sock.clone())
-            };
-
-            sessions.insert(client_addr, session);
+            // 3. Final Path: Lock sessions and insert
+            {
+                let mut sessions = self.sessions.lock();
+                // Double check if session was created by another task in the meantime
+                if sessions.contains_key(&client_addr) {
+                    continue;
+                }
+                
+                let session = if is_valid {
+                    SessionTarget::SeaCore(local_sock.clone())
+                } else {
+                    SessionTarget::Fallback(local_sock.clone())
+                };
+                sessions.insert(client_addr, session);
+            }
 
             // Spawn task to relay replies back to the client
             let public_listener = self.public_listener.clone();
@@ -191,7 +210,7 @@ impl QuicRouter {
                         }
                     }
                 }
-                sessions_map.lock().await.remove(&client_addr);
+                sessions_map.lock().remove(&client_addr);
             });
         }
     }

@@ -1,9 +1,9 @@
 use std::fs;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::AtomicU16;
 use std::collections::HashMap;
-use tokio::sync::Mutex;
+use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
 use eyre::Result;
@@ -24,7 +24,7 @@ use rand::rngs::OsRng;
 use rand::Rng;
 
 use rustls::internal::msgs::handshake::{ClientExtension, UnknownExtension};
-use rustls::internal::msgs::enums::{ExtensionType, ProtocolVersion};
+use rustls::internal::msgs::enums::ExtensionType;
 use rustls::internal::msgs::base::Payload;
 
 fn get_grease_u16() -> u16 {
@@ -453,9 +453,9 @@ pub async fn run_client(config_path: &str) -> Result<()> {
                                                     let assoc_id = pkt.assoc_id();
                                                     let addr = pkt.addr().clone();
                                                     if let Ok(payload) = pkt.payload().await {
-                                                        let routes = bg_routes.lock().await;
+                                                        let routes = bg_routes.lock();
                                                         if let Some(tx) = routes.get(&assoc_id) {
-                                                            let _ = tx.send((payload, addr)).await;
+                                                            let _ = tx.try_send((payload, addr));
                                                         }
                                                     }
                                                 }
@@ -493,9 +493,9 @@ pub async fn run_client(config_path: &str) -> Result<()> {
                                                 let assoc_id = pkt.assoc_id();
                                                 let addr = pkt.addr().clone();
                                                 if let Ok(payload) = pkt.payload().await {
-                                                    let routes = bg_routes_clone.lock().await;
+                                                    let routes = bg_routes_clone.lock();
                                                     if let Some(tx) = routes.get(&assoc_id) {
-                                                        let _ = tx.send((payload, addr)).await;
+                                                        let _ = tx.try_send((payload, addr));
                                                     }
                                                 }
                                             }
@@ -522,9 +522,9 @@ pub async fn run_client(config_path: &str) -> Result<()> {
                                             let assoc_id = pkt.assoc_id();
                                             let addr = pkt.addr().clone();
                                             if let Ok(payload) = pkt.payload().await {
-                                                let routes = bg_routes_clone.lock().await;
+                                                let routes = bg_routes_clone.lock();
                                                 if let Some(tx) = routes.get(&assoc_id) {
-                                                    let _ = tx.send((payload, addr)).await;
+                                                    let _ = tx.try_send((payload, addr));
                                                 }
                                             }
                                         }
@@ -576,6 +576,7 @@ pub async fn run_client(config_path: &str) -> Result<()> {
                             }
                             Err(e) => {
                                 warn!("SOCKS5 accept error: {}", e);
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                             }
                         }
                     }
@@ -804,9 +805,9 @@ async fn handle_socks5_logic(
         }
         stream.write_all(&reply).await?;
 
-        let assoc_id = NEXT_ASSOC_ID.fetch_add(1, Ordering::SeqCst);
-        let (tx, mut rx) = mpsc::channel(1024);
-        udp_routes.lock().await.insert(assoc_id, tx);
+        let assoc_id = NEXT_ASSOC_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let (tx, mut rx) = mpsc::channel::<(bytes::Bytes, Address)>(1024);
+        udp_routes.lock().insert(assoc_id, tx);
 
         let socket_arc = Arc::new(local_socket);
         let socket_recv = socket_arc.clone();
@@ -821,7 +822,7 @@ async fn handle_socks5_logic(
             loop {
                 match socket_recv.recv_from(&mut buf).await {
                     Ok((n, client_addr)) => {
-                        *upload_client_addr.lock().await = Some(client_addr);
+                        *upload_client_addr.lock() = Some(client_addr);
                         let data = &buf[..n];
                         // Parse SOCKS5 UDP header
                         if data.len() < 10 || data[0] != 0 || data[1] != 0 {
@@ -891,14 +892,15 @@ async fn handle_socks5_logic(
             }
             pkt.extend_from_slice(&payload);
             
-            if let Some(caddr) = *client_udp_addr.lock().await {
+            let caddr_opt = *client_udp_addr.lock();
+            if let Some(caddr) = caddr_opt {
                 let _ = socket_arc.send_to(&pkt, caddr).await;
             }
         }
 
         upload_task.abort();
         let _ = conn.dissociate(assoc_id).await;
-        udp_routes.lock().await.remove(&assoc_id);
+        udp_routes.lock().remove(&assoc_id);
         
         return Ok(());
     }
@@ -920,11 +922,11 @@ async fn handle_socks5_logic(
         
         // 1. Establish TLS with Reality Tokens
         let tls_stream = connector.connect(server_name, tcp_stream).await?;
-        let (mut r, mut w) = tokio::io::split(tls_stream);
+        let (r, mut w) = tokio::io::split(tls_stream);
         
         // 2. Send Authenticate Command manually over the raw TLS stream
         let uuid = config.uuid;
-        let mut model = seacore_protocol::model::Connection::<Vec<u8>>::new();
+        let model = seacore_protocol::model::Connection::<Vec<u8>>::new();
         let auth_data = model.send_authenticate(uuid, &config.password, None::<&NoExporter>);
         let header = seacore_protocol::protocol::Header::Authenticate(auth_data);
         header.async_marshal(&mut w).await?;
