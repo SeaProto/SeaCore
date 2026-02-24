@@ -538,8 +538,15 @@ impl Authenticate {
             let expected = exp.export_keying_material(self.uuid.as_bytes(), &context);
             self.token == expected
         } else {
-            // Over TCP, auth is already handled by TLS ClientHello hijacking
-            true
+            // TCP mode fallback token: bind password + timestamp + uuid.
+            let mut hasher = Sha256::new();
+            hasher.update(password.as_ref());
+            hasher.update(&self.timestamp.to_be_bytes());
+            hasher.update(self.uuid.as_bytes());
+            let digest = hasher.finalize();
+            let mut expected = [0u8; 32];
+            expected.copy_from_slice(&digest);
+            self.token == expected
         }
     }
 }

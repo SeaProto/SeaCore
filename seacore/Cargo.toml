@@ -26,3 +26,4 @@ x25519-dalek = { version = "2.0.0", features = ["getrandom", "static_secrets"] }
 rand_core = "0.10.0"
 base64 = "0.22"
 rand = "0.8"
+webpki-roots = "0.26"

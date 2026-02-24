@@ -408,7 +408,7 @@ pub fn verify_reality_auth(
     raw_packet: &[u8],
     server_priv_key: &[u8; 32],
     users: &[crate::server::UserConfig],
-    _short_ids: &[String],
+    short_ids: &[String],
     server_names: &[String],
 ) -> Option<[u8; 32]> {
     let ch = match extract_client_hello(raw_packet) {
@@ -477,17 +477,38 @@ pub fn verify_reality_auth(
     let hm_key = hmac::Key::new(hmac::HMAC_SHA256, shared_secret.as_bytes());
 
     for user in users {
-        let mut msg = Vec::new();
-        msg.extend_from_slice(&ts.to_be_bytes());
-        msg.extend_from_slice(user.uuid.as_bytes());
-        let expected_tag = hmac::sign(&hm_key, &msg);
-        
-        // Constant-time compare 24-byte truncate tag
-        #[allow(deprecated)]
-        if ring::constant_time::verify_slices_are_equal(
-            &expected_tag.as_ref()[..24],
-            &session_id[8..32],
-        ).is_ok() {
+        let mut matched = false;
+        if short_ids.is_empty() {
+            let mut msg = Vec::new();
+            msg.extend_from_slice(&ts.to_be_bytes());
+            msg.extend_from_slice(user.uuid.as_bytes());
+            let expected_tag = hmac::sign(&hm_key, &msg);
+            #[allow(deprecated)]
+            if ring::constant_time::verify_slices_are_equal(
+                &expected_tag.as_ref()[..24],
+                &session_id[8..32],
+            ).is_ok() {
+                matched = true;
+            }
+        } else {
+            for short_id in short_ids {
+                let mut msg = Vec::new();
+                msg.extend_from_slice(&ts.to_be_bytes());
+                msg.extend_from_slice(user.uuid.as_bytes());
+                msg.extend_from_slice(short_id.as_bytes());
+                let expected_tag = hmac::sign(&hm_key, &msg);
+                #[allow(deprecated)]
+                if ring::constant_time::verify_slices_are_equal(
+                    &expected_tag.as_ref()[..24],
+                    &session_id[8..32],
+                ).is_ok() {
+                    matched = true;
+                    break;
+                }
+            }
+        }
+
+        if matched {
             tracing::info!("verify_reality_auth: SUCCESS for user {}", user.uuid);
             let mut token = [0u8; 32];
             token.copy_from_slice(&session_id);
@@ -506,7 +527,7 @@ pub fn verify_tcp_reality_auth(
     tcp_payload: &[u8],
     server_priv_key: &[u8; 32],
     users: &[crate::server::UserConfig],
-    _short_ids: &[String],
+    short_ids: &[String],
     server_names: &[String],
 ) -> Option<[u8; 32]> {
     // 1. Basic TLS Record Layer check
@@ -582,17 +603,38 @@ pub fn verify_tcp_reality_auth(
     let hm_key = hmac::Key::new(hmac::HMAC_SHA256, shared_secret.as_bytes());
 
     for user in users {
-        let mut msg = Vec::new();
-        msg.extend_from_slice(&ts.to_be_bytes());
-        msg.extend_from_slice(user.uuid.as_bytes());
-        let expected_tag = hmac::sign(&hm_key, &msg);
-        
-        // Constant-time compare 24-byte truncate tag
-        #[allow(deprecated)]
-        if ring::constant_time::verify_slices_are_equal(
-            &expected_tag.as_ref()[..24],
-            &session_id[8..32],
-        ).is_ok() {
+        let mut matched = false;
+        if short_ids.is_empty() {
+            let mut msg = Vec::new();
+            msg.extend_from_slice(&ts.to_be_bytes());
+            msg.extend_from_slice(user.uuid.as_bytes());
+            let expected_tag = hmac::sign(&hm_key, &msg);
+            #[allow(deprecated)]
+            if ring::constant_time::verify_slices_are_equal(
+                &expected_tag.as_ref()[..24],
+                &session_id[8..32],
+            ).is_ok() {
+                matched = true;
+            }
+        } else {
+            for short_id in short_ids {
+                let mut msg = Vec::new();
+                msg.extend_from_slice(&ts.to_be_bytes());
+                msg.extend_from_slice(user.uuid.as_bytes());
+                msg.extend_from_slice(short_id.as_bytes());
+                let expected_tag = hmac::sign(&hm_key, &msg);
+                #[allow(deprecated)]
+                if ring::constant_time::verify_slices_are_equal(
+                    &expected_tag.as_ref()[..24],
+                    &session_id[8..32],
+                ).is_ok() {
+                    matched = true;
+                    break;
+                }
+            }
+        }
+
+        if matched {
             tracing::info!("verify_tcp_reality_auth: SUCCESS for user {}", user.uuid);
             let mut token = [0u8; 32];
             token.copy_from_slice(&session_id);

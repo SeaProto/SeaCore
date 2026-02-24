@@ -76,7 +76,15 @@ where
             };
             exp.export_keying_material(uuid.as_bytes(), &context)
         } else {
-            [0u8; 32] // TCP placeholder token
+            // TCP mode fallback token: bind password + timestamp + uuid.
+            let mut hasher = Sha256::new();
+            hasher.update(password.as_ref());
+            hasher.update(&timestamp.to_be_bytes());
+            hasher.update(uuid.as_bytes());
+            let digest = hasher.finalize();
+            let mut token = [0u8; 32];
+            token.copy_from_slice(&digest);
+            token
         };
         AuthenticateHeader::new(uuid, timestamp, token)
     }
@@ -112,7 +120,15 @@ where
             let expected = exp.export_keying_material(uuid.as_bytes(), &context);
             token == expected
         } else {
-            true // Over TCP, auth is already handled by TLS ClientHello hijacking or manual logic
+            // TCP mode fallback token: bind password + timestamp + uuid.
+            let mut hasher = Sha256::new();
+            hasher.update(password.as_ref());
+            hasher.update(&timestamp.to_be_bytes());
+            hasher.update(uuid.as_bytes());
+            let digest = hasher.finalize();
+            let mut expected = [0u8; 32];
+            expected.copy_from_slice(&digest);
+            token == expected
         }
     }
 

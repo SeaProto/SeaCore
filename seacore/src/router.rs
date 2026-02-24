@@ -2,9 +2,9 @@ use eyre::Result;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 use tracing::{debug, info, warn};
 
 use crate::sniffer;
@@ -12,6 +12,21 @@ use crate::sniffer;
 enum SessionTarget {
     SeaCore(Arc<UdpSocket>),
     Fallback(Arc<UdpSocket>),
+}
+
+impl SessionTarget {
+    fn socket(&self) -> Arc<UdpSocket> {
+        match self {
+            SessionTarget::SeaCore(s) => s.clone(),
+            SessionTarget::Fallback(s) => s.clone(),
+        }
+    }
+}
+
+struct SessionEntry {
+    target: SessionTarget,
+    last_seen: Instant,
+    close_tx: watch::Sender<bool>,
 }
 
 /// Cache of recently seen tokens for replay protection.
@@ -46,7 +61,7 @@ pub struct QuicRouter {
     public_listener: Arc<UdpSocket>,
     quinn_addr: SocketAddr,
     fallback_addr: SocketAddr,
-    sessions: Arc<Mutex<HashMap<SocketAddr, SessionTarget>>>,
+    sessions: Arc<Mutex<HashMap<SocketAddr, SessionEntry>>>,
     server_priv_key: [u8; 32],
     users: Vec<crate::server::UserConfig>,
     short_ids: Vec<String>,
@@ -84,6 +99,43 @@ impl QuicRouter {
     }
 
     pub async fn run(self) -> Result<()> {
+        const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+        const SESSION_CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
+
+        let sessions_cleanup = self.sessions.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(SESSION_CLEANUP_INTERVAL).await;
+                let now = Instant::now();
+                let mut close_list: Vec<(SocketAddr, watch::Sender<bool>)> = Vec::new();
+
+                {
+                    let mut sessions = sessions_cleanup.lock().await;
+                    let stale: Vec<SocketAddr> = sessions
+                        .iter()
+                        .filter_map(|(addr, entry)| {
+                            if now.saturating_duration_since(entry.last_seen) >= SESSION_IDLE_TIMEOUT {
+                                Some(*addr)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+
+                    for addr in stale {
+                        if let Some(entry) = sessions.remove(&addr) {
+                            close_list.push((addr, entry.close_tx));
+                        }
+                    }
+                }
+
+                for (addr, tx) in close_list {
+                    let _ = tx.send(true);
+                    debug!("Router session {} cleaned by idle timeout", addr);
+                }
+            }
+        });
+
         let mut buf = vec![0u8; 65535];
 
         loop {
@@ -96,16 +148,31 @@ impl QuicRouter {
             };
 
             let packet = &buf[..len];
-            let mut sessions = self.sessions.lock().await;
 
-            // Check if existing session
-            if let Some(target) = sessions.get(&client_addr) {
-                let sock = match target {
-                    SessionTarget::SeaCore(s) => s,
-                    SessionTarget::Fallback(s) => s,
-                };
+            // Check existing session, but never await while holding the sessions lock.
+            let existing_socket = {
+                let mut sessions = self.sessions.lock().await;
+                if let Some(entry) = sessions.get_mut(&client_addr) {
+                    entry.last_seen = Instant::now();
+                    Some(entry.target.socket())
+                } else {
+                    None
+                }
+            };
+
+            if let Some(sock) = existing_socket {
                 if let Err(e) = sock.send(packet).await {
-                    warn!("Failed to forward packet for existing session {}: {}", client_addr, e);
+                    warn!(
+                        "Failed to forward packet for existing session {}: {}",
+                        client_addr, e
+                    );
+                    let close_tx = {
+                        let mut sessions = self.sessions.lock().await;
+                        sessions.remove(&client_addr).map(|entry| entry.close_tx)
+                    };
+                    if let Some(tx) = close_tx {
+                        let _ = tx.send(true);
+                    }
                 }
                 continue;
             }
@@ -164,13 +231,13 @@ impl QuicRouter {
                 continue;
             }
 
-            let session = if is_valid {
+            let target = if is_valid {
                 SessionTarget::SeaCore(local_sock.clone())
             } else {
                 SessionTarget::Fallback(local_sock.clone())
             };
 
-            sessions.insert(client_addr, session);
+            let (close_tx, mut close_rx) = watch::channel(false);
 
             // Spawn task to relay replies back to the client
             let public_listener = self.public_listener.clone();
@@ -178,21 +245,42 @@ impl QuicRouter {
             tokio::spawn(async move {
                 let mut reply_buf = vec![0u8; 65535];
                 loop {
-                    match local_sock.recv(&mut reply_buf).await {
-                        Ok(len) => {
-                            if let Err(e) = public_listener.send_to(&reply_buf[..len], client_addr).await {
-                                warn!("Failed to relay response to {}: {}", client_addr, e);
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            debug!("Local relay socket closed for {}: {}", client_addr, e);
+                    tokio::select! {
+                        _ = close_rx.changed() => {
                             break;
+                        }
+                        recv = local_sock.recv(&mut reply_buf) => {
+                            match recv {
+                                Ok(len) => {
+                                    if let Err(e) = public_listener.send_to(&reply_buf[..len], client_addr).await {
+                                        warn!("Failed to relay response to {}: {}", client_addr, e);
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    debug!("Local relay socket closed for {}: {}", client_addr, e);
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
-                sessions_map.lock().await.remove(&client_addr);
+                let mut sessions = sessions_map.lock().await;
+                let should_remove = sessions
+                    .get(&client_addr)
+                    .map(|entry| Arc::ptr_eq(&entry.target.socket(), &local_sock))
+                    .unwrap_or(false);
+                if should_remove {
+                    sessions.remove(&client_addr);
+                }
             });
+
+            let entry = SessionEntry {
+                target,
+                last_seen: Instant::now(),
+                close_tx,
+            };
+            self.sessions.lock().await.insert(client_addr, entry);
         }
     }
 }

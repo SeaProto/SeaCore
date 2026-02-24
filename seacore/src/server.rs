@@ -499,26 +499,21 @@ async fn handle_connection(
                         }
                         Ok(Task::Ping { seq_id, timestamp }) => {
                             // Echo ping back
-                            let _ = seacore_conn_dg.ping(seq_id, timestamp);
+                            let _ = seacore_conn_dg.ping(seq_id, timestamp).await;
                         }
                         Ok(Task::Packet(pkt)) => {
                             let assoc_id = pkt.assoc_id();
                             let addr = pkt.addr().clone();
-                            let udp_assocs = udp_assocs_dg.clone();
-                            let udp_assoc_touches = udp_assoc_touches_dg.clone();
-                            let seacore_conn_clone = seacore_conn_dg.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = handle_server_udp_packet(
-                                    pkt,
-                                    addr,
-                                    assoc_id,
-                                    udp_assocs,
-                                    udp_assoc_touches,
-                                    seacore_conn_clone,
-                                ).await {
-                                    warn!("UDP packet handling error: {}", e);
-                                }
-                            });
+                            if let Err(e) = handle_server_udp_packet(
+                                pkt,
+                                addr,
+                                assoc_id,
+                                udp_assocs_dg.clone(),
+                                udp_assoc_touches_dg.clone(),
+                                seacore_conn_dg.clone(),
+                            ).await {
+                                warn!("UDP packet handling error: {}", e);
+                            }
                         }
                         Ok(_) => {}
                         Err(e) => {
@@ -541,48 +536,40 @@ async fn handle_connection(
             uni = conn_for_streams.accept_uni() => {
                 match uni {
                     Ok(recv) => {
-                        let seacore_conn = seacore_conn.clone();
-                        let _config = config.clone();
-                        let udp_assocs = udp_assocs.clone();
-                        let udp_assoc_touches = udp_assoc_touches.clone();
-                        tokio::spawn(async move {
-                            match seacore_conn.accept_uni_stream(seacore_protocol::quic::SeaCoreReadStream::Quic(recv)).await {
-                                Ok(Task::Authenticate(_auth)) => {
-                                    warn!("Received redundant or delayed Authenticate command");
-                                }
-                                Ok(Task::Dissociate(assoc_id)) => {
-                                    info!("Dissociate UDP session {}", assoc_id);
-                                    let mut assocs = udp_assocs.lock().await;
-                                    if let Some(assoc) = assocs.remove(&assoc_id) {
-                                        assoc.task.abort();
-                                    }
-                                    udp_assoc_touches.lock().await.remove(&assoc_id);
-                                }
-                                Ok(Task::Packet(pkt)) => {
-                                    let assoc_id = pkt.assoc_id();
-                                    let addr = pkt.addr().clone();
-                                    let udp_assocs = udp_assocs.clone();
-                                    let udp_assoc_touches = udp_assoc_touches.clone();
-                                    let seacore_conn_clone = seacore_conn.clone();
-                                    tokio::spawn(async move {
-                                        if let Err(e) = handle_server_udp_packet(
-                                            pkt,
-                                            addr,
-                                            assoc_id,
-                                            udp_assocs,
-                                            udp_assoc_touches,
-                                            seacore_conn_clone,
-                                        ).await {
-                                            warn!("UDP packet handling error: {}", e);
-                                        }
-                                    });
-                                }
-                                Ok(_) => {}
-                                // H3 SETTINGS/QPACK streams from client will fail to
-                                // parse as SeaCore protocol — silently ignore them
-                                Err(_) => {}
+                        match seacore_conn
+                            .accept_uni_stream(seacore_protocol::quic::SeaCoreReadStream::Quic(recv))
+                            .await
+                        {
+                            Ok(Task::Authenticate(_auth)) => {
+                                warn!("Received redundant or delayed Authenticate command");
                             }
-                        });
+                            Ok(Task::Dissociate(assoc_id)) => {
+                                info!("Dissociate UDP session {}", assoc_id);
+                                let mut assocs = udp_assocs.lock().await;
+                                if let Some(assoc) = assocs.remove(&assoc_id) {
+                                    assoc.task.abort();
+                                }
+                                udp_assoc_touches.lock().await.remove(&assoc_id);
+                            }
+                            Ok(Task::Packet(pkt)) => {
+                                let assoc_id = pkt.assoc_id();
+                                let addr = pkt.addr().clone();
+                                if let Err(e) = handle_server_udp_packet(
+                                    pkt,
+                                    addr,
+                                    assoc_id,
+                                    udp_assocs.clone(),
+                                    udp_assoc_touches.clone(),
+                                    seacore_conn.clone(),
+                                ).await {
+                                    warn!("UDP packet handling error: {}", e);
+                                }
+                            }
+                            Ok(_) => {}
+                            // H3 SETTINGS/QPACK streams from client will fail to
+                            // parse as SeaCore protocol — silently ignore them
+                            Err(_) => {}
+                        }
                     }
                     Err(e) => {
                         info!("Connection closed (uni): {}", e);
@@ -869,21 +856,16 @@ async fn handle_tcp_connection(
             Ok(Task::Packet(pkt)) => {
                 let assoc_id = pkt.assoc_id();
                 let addr = pkt.addr().clone();
-                let udp_assocs_clone = udp_assocs.clone();
-                let udp_assoc_touches_clone = udp_assoc_touches.clone();
-                let seacore_conn_clone = seacore_conn.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = handle_server_udp_packet(
-                        pkt,
-                        addr,
-                        assoc_id,
-                        udp_assocs_clone,
-                        udp_assoc_touches_clone,
-                        seacore_conn_clone,
-                    ).await {
-                        warn!("TCP UDP packet handling error: {}", e);
-                    }
-                });
+                if let Err(e) = handle_server_udp_packet(
+                    pkt,
+                    addr,
+                    assoc_id,
+                    udp_assocs.clone(),
+                    udp_assoc_touches.clone(),
+                    seacore_conn.clone(),
+                ).await {
+                    warn!("TCP UDP packet handling error: {}", e);
+                }
             }
             Ok(Task::Connect(_bistream, addr)) => {
                 info!("TCP CONNECT request over authenticated Reality connection to {}", addr);

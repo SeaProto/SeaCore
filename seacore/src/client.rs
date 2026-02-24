@@ -1,6 +1,6 @@
 use std::fs;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::collections::HashMap;
 use std::cmp::Reverse;
@@ -51,6 +51,7 @@ pub struct ClientConfig {
     pub idle_session_check_interval_secs: Option<u64>,
     pub idle_session_timeout_secs: Option<u64>,
     pub min_idle_sessions: Option<usize>,
+    pub insecure_skip_verify: Option<bool>,
     pub reality: Option<RealitySettings>,
 }
 
@@ -91,6 +92,8 @@ fn idle_session_policy_from_client_config(config: &ClientConfig) -> IdleSessionP
 }
 
 static NEXT_ASSOC_ID: AtomicU16 = AtomicU16::new(1);
+static REALITY_CLIENT_SECRET: OnceLock<StaticSecret> = OnceLock::new();
+static REALITY_KX_GROUP: OnceLock<&'static dyn SupportedKxGroup> = OnceLock::new();
 
 /// Simulate Chrome's HTTP/3 initialization by opening Control, QPACK Encoder,
 /// and QPACK Decoder unidirectional streams with appropriate settings.
@@ -176,7 +179,10 @@ fn build_tls_config(config: &ClientConfig) -> Result<rustls::ClientConfig> {
         server_pub_arr.copy_from_slice(&server_pub_bytes);
         let server_pub = PublicKey::from(server_pub_arr);
 
-        let client_secret = StaticSecret::random_from_rng(OsRng);
+        // Keep one in-process static secret/group to avoid reconnect-time leaks.
+        let client_secret = REALITY_CLIENT_SECRET
+            .get_or_init(|| StaticSecret::random_from_rng(OsRng))
+            .clone();
         let shared_secret = client_secret.diffie_hellman(&server_pub);
         
         use ring::hmac;
@@ -192,21 +198,37 @@ fn build_tls_config(config: &ClientConfig) -> Result<rustls::ClientConfig> {
         let mut msg = Vec::new();
         msg.extend_from_slice(&now.to_be_bytes());
         msg.extend_from_slice(config.uuid.as_bytes());
+        if let Some(short_id) = reality.short_id.as_ref() {
+            msg.extend_from_slice(short_id.as_bytes());
+        }
         let tag = hmac::sign(&key, &msg);
         session_id[8..32].copy_from_slice(&tag.as_ref()[..24]);
 
         custom_session_id_opt = Some(session_id.into());
 
-        let custom_group = CustomX25519Group { secret: client_secret };
-        let leaked_group: &'static dyn SupportedKxGroup = Box::leak(Box::new(custom_group));
+        let leaked_group: &'static dyn SupportedKxGroup = *REALITY_KX_GROUP.get_or_init(|| {
+            Box::leak(Box::new(CustomX25519Group {
+                secret: client_secret.clone(),
+            })) as &'static dyn SupportedKxGroup
+        });
         provider.kx_groups.insert(0, leaked_group);
     }
 
-    let mut client_crypto = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
-        .with_safe_default_protocol_versions()?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(SkipVerification))
-        .with_no_client_auth();
+    let insecure_skip_verify = config.insecure_skip_verify.unwrap_or(false);
+    let mut client_crypto = if insecure_skip_verify {
+        rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+            .with_safe_default_protocol_versions()?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(SkipVerification))
+            .with_no_client_auth()
+    } else {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+            .with_safe_default_protocol_versions()?
+            .with_root_certificates(roots)
+            .with_no_client_auth()
+    };
 
     client_crypto.alpn_protocols = vec![b"h3".to_vec()];
     client_crypto.extra_exts = extra_exts;
@@ -240,6 +262,9 @@ pub async fn run_client(config_path: &str) -> Result<()> {
 
     info!("Server: {}", config.server);
     info!("SOCKS5 listen: {}", config.socks5_listen);
+    if config.insecure_skip_verify.unwrap_or(false) {
+        warn!("TLS certificate verification is disabled (insecure_skip_verify=true)");
+    }
     info!(
         "Idle session policy: check={}s timeout={}s min_idle={}",
         idle_policy.check_interval.as_secs(),
