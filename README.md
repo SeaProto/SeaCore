@@ -74,6 +74,7 @@ To start the client, you need a corresponding `client.json` with the matching `p
 {
     "server": "your_server_ip:4430",
     "transport": "udp",
+    "insecure_skip_verify": true,
     "idle_session_check_interval_secs": 5,
     "idle_session_timeout_secs": 10,
     "min_idle_sessions": 0,
