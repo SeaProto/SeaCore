@@ -1,7 +1,12 @@
 use rustls::CipherSuite;
 use rustls::ClientConfig as RustlsClientConfig;
 use rustls::ExtensionType;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
+
+pub const REALITY_TEMP_CERT_PROOF_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 57264, 1, 1];
+pub const REALITY_TEMP_CERT_PROOF_OID_STR: &str = "1.3.6.1.4.1.57264.1.1";
+const REALITY_TEMP_CERT_LABEL: &[u8] = b"seacore-reality-temp-cert-v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrowserProfile {
@@ -147,6 +152,22 @@ impl RealityConfig {
     }
 }
 
+pub fn derive_temp_cert_proof(
+    shared_secret: &[u8; 32],
+    session_id: &[u8; 32],
+    server_name: &str,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(REALITY_TEMP_CERT_LABEL);
+    hasher.update(shared_secret);
+    hasher.update(session_id);
+    hasher.update(server_name.as_bytes());
+
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&hasher.finalize());
+    out
+}
+
 pub fn parse_short_id_hex(raw: &str) -> Result<[u8; 8], ShortIdParseError> {
     let normalized: String = raw
         .chars()
@@ -218,5 +239,18 @@ mod tests {
     fn parse_short_id_hex_rejects_invalid_hex() {
         let err = parse_short_id_hex("00112233445566zz").expect_err("invalid hex should fail");
         assert_eq!(err, ShortIdParseError::InvalidHex(14));
+    }
+
+    #[test]
+    fn temp_cert_proof_is_stable() {
+        let shared_secret = [0x11u8; 32];
+        let session_id = [0x22u8; 32];
+
+        let a = derive_temp_cert_proof(&shared_secret, &session_id, "www.apple.com");
+        let b = derive_temp_cert_proof(&shared_secret, &session_id, "www.apple.com");
+        let c = derive_temp_cert_proof(&shared_secret, &session_id, "icloud.com");
+
+        assert_eq!(a, b);
+        assert_ne!(a, c);
     }
 }

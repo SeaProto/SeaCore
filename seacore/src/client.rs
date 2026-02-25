@@ -2,7 +2,7 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU8, Ordering};
 use std::sync::Mutex as StdMutex;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -76,6 +76,7 @@ pub struct RealitySettings {
     pub public_key: Option<String>,
     #[allow(dead_code)]
     pub short_id: Option<String>,
+    pub spider_x: Option<String>,
 }
 
 fn default_server_name() -> String {
@@ -222,11 +223,65 @@ fn browser_profile_from_config(config: &ClientConfig) -> BrowserProfile {
     }
 }
 
-fn build_tls_config(config: &ClientConfig) -> Result<rustls::ClientConfig> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RealityCertDecision {
+    Unknown = 0,
+    TemporaryTrusted = 1,
+    RealCertificate = 2,
+    LegacyAccepted = 3,
+    Invalid = 4,
+}
+
+#[derive(Clone, Debug)]
+struct RealityCertState {
+    decision: Arc<AtomicU8>,
+}
+
+impl RealityCertState {
+    fn new() -> Self {
+        Self {
+            decision: Arc::new(AtomicU8::new(RealityCertDecision::Unknown as u8)),
+        }
+    }
+
+    fn reset(&self) {
+        self.decision
+            .store(RealityCertDecision::Unknown as u8, Ordering::Relaxed);
+    }
+
+    fn mark(&self, decision: RealityCertDecision) {
+        self.decision.store(decision as u8, Ordering::Relaxed);
+    }
+
+    fn decision(&self) -> RealityCertDecision {
+        match self.decision.load(Ordering::Relaxed) {
+            1 => RealityCertDecision::TemporaryTrusted,
+            2 => RealityCertDecision::RealCertificate,
+            3 => RealityCertDecision::LegacyAccepted,
+            4 => RealityCertDecision::Invalid,
+            _ => RealityCertDecision::Unknown,
+        }
+    }
+
+    fn saw_real_certificate(&self) -> bool {
+        self.decision() == RealityCertDecision::RealCertificate
+    }
+}
+
+fn build_tls_config(
+    config: &ClientConfig,
+) -> Result<(rustls::ClientConfig, Option<RealityCertState>)> {
     let profile = browser_profile_from_config(config);
     let mut provider = rustls::crypto::ring::default_provider();
     let mut custom_session_id_opt = None;
     let mut extra_exts = Vec::new();
+    let mut reality_expected_cert_proof = None;
+    let reality_mode = config.reality.is_some();
+    let reality_cert_state = if reality_mode {
+        Some(RealityCertState::new())
+    } else {
+        None
+    };
 
     // 1. GREASE extension at the beginning
     let grease_ext_type = ExtensionType::from(get_grease_u16());
@@ -270,6 +325,8 @@ fn build_tls_config(config: &ClientConfig) -> Result<rustls::ClientConfig> {
         // long-lived per-process key reuse fingerprints.
         let client_secret = rotate_reality_client_secret();
         let shared_secret = client_secret.diffie_hellman(&server_pub);
+        let mut shared_secret_bytes = [0u8; 32];
+        shared_secret_bytes.copy_from_slice(shared_secret.as_bytes());
 
         use ring::hmac;
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -292,6 +349,12 @@ fn build_tls_config(config: &ClientConfig) -> Result<rustls::ClientConfig> {
         let tag = hmac::sign(&key, &msg);
         session_id[8..32].copy_from_slice(&tag.as_ref()[..24]);
 
+        reality_expected_cert_proof = Some(seacore_protocol::reality::derive_temp_cert_proof(
+            &shared_secret_bytes,
+            &session_id,
+            &reality.server_name,
+        ));
+
         custom_session_id_opt = Some(session_id.into());
 
         let leaked_group: &'static dyn SupportedKxGroup = *REALITY_KX_GROUP.get_or_init(|| {
@@ -307,7 +370,9 @@ fn build_tls_config(config: &ClientConfig) -> Result<rustls::ClientConfig> {
         .map(parse_cert_sha256_pin)
         .transpose()?;
 
-    let mut client_crypto = if insecure_skip_verify || cert_pin.is_some() {
+    let allow_invalid_cert_chain = insecure_skip_verify || reality_mode;
+
+    let mut client_crypto = if allow_invalid_cert_chain || cert_pin.is_some() {
         let mut roots = rustls::RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
@@ -317,8 +382,11 @@ fn build_tls_config(config: &ClientConfig) -> Result<rustls::ClientConfig> {
 
         let verifier = SeaCoreServerVerifier {
             webpki,
-            allow_invalid_cert_chain: insecure_skip_verify,
+            allow_invalid_cert_chain,
             pinned_sha256: cert_pin,
+            reality_mode,
+            reality_expected_cert_proof,
+            reality_cert_state: reality_cert_state.clone(),
         };
 
         rustls::ClientConfig::builder_with_provider(Arc::new(provider))
@@ -357,7 +425,43 @@ fn build_tls_config(config: &ClientConfig) -> Result<rustls::ClientConfig> {
         reality_cfg.apply_to_rustls(&mut client_crypto);
     }
 
-    Ok(client_crypto)
+    Ok((client_crypto, reality_cert_state))
+}
+
+fn normalize_spider_path(spider_x: &str) -> String {
+    let trimmed = spider_x.trim();
+    if trimmed.is_empty() {
+        return "/".to_string();
+    }
+    if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{}", trimmed)
+    }
+}
+
+async fn run_reality_spider(
+    tls_stream: &mut tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+    host: &str,
+    spider_x: &str,
+) -> Result<()> {
+    let path = normalize_spider_path(spider_x);
+    let request = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36\r\nAccept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\nAccept-Language: en-US,en;q=0.9\r\nConnection: close\r\n\r\n",
+        path, host
+    );
+
+    let _ = tokio::time::timeout(
+        Duration::from_secs(3),
+        tls_stream.write_all(request.as_bytes()),
+    )
+    .await;
+
+    let mut sink = vec![0u8; 8192];
+    let _ = tokio::time::timeout(Duration::from_secs(3), tls_stream.read(&mut sink)).await;
+    let _ = tokio::time::timeout(Duration::from_millis(250), tls_stream.shutdown()).await;
+
+    Ok(())
 }
 
 pub async fn run_client(config_path: &str) -> Result<()> {
@@ -385,6 +489,12 @@ pub async fn run_client(config_path: &str) -> Result<()> {
 
     info!("Server: {}", config.server);
     info!("SOCKS5 listen: {}", config.socks5_listen);
+    if config.reality.is_some() {
+        info!(
+            "REALITY mode enabled: client accepts temporary trusted certificates and enters spider mode on real-site certificates"
+        );
+    }
+
     if config.insecure_skip_verify.unwrap_or(false) {
         if config.server_cert_sha256.is_some() {
             warn!(
@@ -498,7 +608,7 @@ pub async fn run_client(config_path: &str) -> Result<()> {
             let _reality_handshake_guard = reality_handshake_lock().lock().await;
 
             // Refresh Reality token/session id on every reconnect attempt.
-            let base_tls_config = build_tls_config(&config)?;
+            let (base_tls_config, reality_cert_state) = build_tls_config(&config)?;
             let mut client_config = quinn::ClientConfig::new(Arc::new(
                 quinn::crypto::rustls::QuicClientConfig::try_from(base_tls_config.clone())?,
             ));
@@ -511,12 +621,30 @@ pub async fn run_client(config_path: &str) -> Result<()> {
             let handshake_timeout = session_policy.handshake_timeout;
 
             if transport_mode == "udp" || transport_mode == "auto" {
+                if let Some(state) = &reality_cert_state {
+                    state.reset();
+                }
                 match endpoint.connect(config.server, &config.server_name) {
                     Ok(connecting) => {
                         match tokio::time::timeout(handshake_timeout, connecting).await {
                             Ok(Ok(c)) => {
-                                info!("Connected to server {} via QUIC (UDP)", config.server);
-                                connected_inner = Some(seacore_protocol::quic::InnerConn::Quic(c));
+                                if reality_cert_state
+                                    .as_ref()
+                                    .map(RealityCertState::saw_real_certificate)
+                                    .unwrap_or(false)
+                                {
+                                    warn!(
+                                        "REALITY received a real site certificate on QUIC path; closing and retrying"
+                                    );
+                                    c.close(
+                                        quinn::VarInt::from_u32(0x00),
+                                        b"reality real certificate",
+                                    );
+                                } else {
+                                    info!("Connected to server {} via QUIC (UDP)", config.server);
+                                    connected_inner =
+                                        Some(seacore_protocol::quic::InnerConn::Quic(c));
+                                }
                             }
                             Ok(Err(e)) => {
                                 if transport_mode == "udp" {
@@ -547,6 +675,21 @@ pub async fn run_client(config_path: &str) -> Result<()> {
                     info!("QUIC (UDP) failed or timed out, falling back to TCP...");
                 }
 
+                if let Some(state) = &reality_cert_state {
+                    state.reset();
+                }
+
+                let spider_host = config
+                    .reality
+                    .as_ref()
+                    .map(|r| r.server_name.clone())
+                    .unwrap_or_else(|| config.server_name.clone());
+                let spider_x = config
+                    .reality
+                    .as_ref()
+                    .and_then(|r| r.spider_x.as_deref())
+                    .unwrap_or("/");
+
                 // Connect TCP
                 match tokio::time::timeout(
                     handshake_timeout,
@@ -568,15 +711,28 @@ pub async fn run_client(config_path: &str) -> Result<()> {
                         )
                         .await
                         {
-                            Ok(Ok(tls_stream)) => {
-                                info!("Connected to server {} via TLS (TCP)", config.server);
-                                // We don't fully implement multiplexing over a single TCP stream yet for SeaCore connect/dissociate.
-                                // But for simple packet tunneling, wrapping it in InnerConn works. Needs a loop handling.
-                                let (r, w) = tokio::io::split(tls_stream);
-                                connected_inner = Some(seacore_protocol::quic::InnerConn::Tcp(
-                                    Arc::new(tokio::sync::Mutex::new(Box::new(w))),
-                                ));
-                                tcp_read_half = Some(Box::new(r));
+                            Ok(Ok(mut tls_stream)) => {
+                                if reality_cert_state
+                                    .as_ref()
+                                    .map(RealityCertState::saw_real_certificate)
+                                    .unwrap_or(false)
+                                {
+                                    warn!(
+                                        "REALITY received real certificate on TCP path; entering spider mode"
+                                    );
+                                    let _ =
+                                        run_reality_spider(&mut tls_stream, &spider_host, spider_x)
+                                            .await;
+                                } else {
+                                    info!("Connected to server {} via TLS (TCP)", config.server);
+                                    // We don't fully implement multiplexing over a single TCP stream yet for SeaCore connect/dissociate.
+                                    // But for simple packet tunneling, wrapping it in InnerConn works. Needs a loop handling.
+                                    let (r, w) = tokio::io::split(tls_stream);
+                                    connected_inner = Some(seacore_protocol::quic::InnerConn::Tcp(
+                                        Arc::new(tokio::sync::Mutex::new(Box::new(w))),
+                                    ));
+                                    tcp_read_half = Some(Box::new(r));
+                                }
                             }
                             Ok(Err(e)) => {
                                 warn!("TLS over TCP failed: {}", e);
@@ -1209,11 +1365,14 @@ async fn handle_socks4(
             .unwrap_or_else(|| "apple.com".into());
         let mut tls_stream = {
             let _reality_handshake_guard = reality_handshake_lock().lock().await;
-            let tcp_tls_config = build_tls_config(&config)?;
+            let (tcp_tls_config, reality_cert_state) = build_tls_config(&config)?;
+            if let Some(state) = &reality_cert_state {
+                state.reset();
+            }
             let connector = tokio_rustls::TlsConnector::from(Arc::new(tcp_tls_config));
             let server_name =
                 rustls::pki_types::ServerName::try_from(domain_sni.as_str())?.to_owned();
-            tokio::time::timeout(
+            let mut tls_stream = tokio::time::timeout(
                 handshake_timeout,
                 connector.connect(server_name, tcp_stream),
             )
@@ -1223,7 +1382,32 @@ async fn handle_socks4(
                     "SOCKS4 TLS handshake timed out after {}s",
                     handshake_timeout.as_secs()
                 )
-            })??
+            })??;
+
+            if reality_cert_state
+                .as_ref()
+                .map(RealityCertState::saw_real_certificate)
+                .unwrap_or(false)
+            {
+                warn!(
+                    "SOCKS4 REALITY received real certificate for {}; entering spider mode",
+                    domain_sni
+                );
+                let spider_x = config
+                    .reality
+                    .as_ref()
+                    .and_then(|r| r.spider_x.as_deref())
+                    .unwrap_or("/");
+                let _ = run_reality_spider(&mut tls_stream, &domain_sni, spider_x).await;
+                stream
+                    .write_all(&[0x00, 0x5B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+                    .await?;
+                return Err(eyre::eyre!(
+                    "REALITY rejected as real-site certificate; spider mode triggered"
+                ));
+            }
+
+            tls_stream
         };
 
         // Authenticate
@@ -1590,10 +1774,13 @@ async fn handle_socks5_logic(
         // 1. Establish TLS with Reality Tokens
         let mut tls_stream = {
             let _reality_handshake_guard = reality_handshake_lock().lock().await;
-            let tcp_tls_config = build_tls_config(&config)?;
+            let (tcp_tls_config, reality_cert_state) = build_tls_config(&config)?;
+            if let Some(state) = &reality_cert_state {
+                state.reset();
+            }
             let connector = tokio_rustls::TlsConnector::from(Arc::new(tcp_tls_config));
             let server_name = rustls::pki_types::ServerName::try_from(domain.as_str())?.to_owned();
-            tokio::time::timeout(
+            let mut tls_stream = tokio::time::timeout(
                 session_policy.handshake_timeout,
                 connector.connect(server_name, tcp_stream),
             )
@@ -1603,7 +1790,32 @@ async fn handle_socks5_logic(
                     "SOCKS5 TLS handshake timed out after {}s",
                     session_policy.handshake_timeout.as_secs()
                 )
-            })??
+            })??;
+
+            if reality_cert_state
+                .as_ref()
+                .map(RealityCertState::saw_real_certificate)
+                .unwrap_or(false)
+            {
+                warn!(
+                    "SOCKS5 REALITY received real certificate for {}; entering spider mode",
+                    domain
+                );
+                let spider_x = config
+                    .reality
+                    .as_ref()
+                    .and_then(|r| r.spider_x.as_deref())
+                    .unwrap_or("/");
+                let _ = run_reality_spider(&mut tls_stream, &domain, spider_x).await;
+                stream
+                    .write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                    .await?;
+                return Err(eyre::eyre!(
+                    "REALITY rejected as real-site certificate; spider mode triggered"
+                ));
+            }
+
+            tls_stream
         };
 
         // 2. Send Authenticate Command manually over the raw TLS stream
@@ -1721,6 +1933,39 @@ struct SeaCoreServerVerifier {
     webpki: Arc<rustls::client::WebPkiServerVerifier>,
     allow_invalid_cert_chain: bool,
     pinned_sha256: Option<[u8; 32]>,
+    reality_mode: bool,
+    reality_expected_cert_proof: Option<[u8; 32]>,
+    reality_cert_state: Option<RealityCertState>,
+}
+
+fn extract_reality_temp_cert_proof(cert_der: &[u8]) -> Option<Vec<u8>> {
+    use x509_parser::certificate::X509Certificate;
+    use x509_parser::prelude::FromDer;
+
+    let (_, cert) = X509Certificate::from_der(cert_der).ok()?;
+    cert.extensions()
+        .iter()
+        .find(|ext| {
+            ext.oid.to_id_string() == seacore_protocol::reality::REALITY_TEMP_CERT_PROOF_OID_STR
+        })
+        .map(|ext| ext.value.to_vec())
+}
+
+impl SeaCoreServerVerifier {
+    fn verify_pin(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+    ) -> std::result::Result<(), rustls::Error> {
+        if let Some(expected_pin) = self.pinned_sha256 {
+            let actual = ring::digest::digest(&ring::digest::SHA256, end_entity.as_ref());
+            if actual.as_ref() != expected_pin.as_slice() {
+                return Err(rustls::Error::General(
+                    "server certificate SHA-256 pin mismatch".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl rustls::client::danger::ServerCertVerifier for SeaCoreServerVerifier {
@@ -1732,6 +1977,51 @@ impl rustls::client::danger::ServerCertVerifier for SeaCoreServerVerifier {
         ocsp_response: &[u8],
         now: rustls::pki_types::UnixTime,
     ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if self.reality_mode {
+            if let Some(expected_proof) = self.reality_expected_cert_proof {
+                if let Some(actual_proof) = extract_reality_temp_cert_proof(end_entity.as_ref()) {
+                    if actual_proof.as_slice() == &expected_proof {
+                        if let Some(state) = &self.reality_cert_state {
+                            state.mark(RealityCertDecision::TemporaryTrusted);
+                        }
+                        self.verify_pin(end_entity)?;
+                        return Ok(rustls::client::danger::ServerCertVerified::assertion());
+                    }
+                }
+            }
+
+            let webpki_result = rustls::client::danger::ServerCertVerifier::verify_server_cert(
+                self.webpki.as_ref(),
+                end_entity,
+                intermediates,
+                server_name,
+                ocsp_response,
+                now,
+            );
+            if webpki_result.is_ok() {
+                if let Some(state) = &self.reality_cert_state {
+                    state.mark(RealityCertDecision::RealCertificate);
+                }
+                self.verify_pin(end_entity)?;
+                return Ok(rustls::client::danger::ServerCertVerified::assertion());
+            }
+
+            if self.allow_invalid_cert_chain {
+                if let Some(state) = &self.reality_cert_state {
+                    state.mark(RealityCertDecision::LegacyAccepted);
+                }
+                self.verify_pin(end_entity)?;
+                return Ok(rustls::client::danger::ServerCertVerified::assertion());
+            }
+
+            if let Some(state) = &self.reality_cert_state {
+                state.mark(RealityCertDecision::Invalid);
+            }
+            return Err(rustls::Error::General(
+                "REALITY certificate verification failed".to_string(),
+            ));
+        }
+
         if !self.allow_invalid_cert_chain {
             rustls::client::danger::ServerCertVerifier::verify_server_cert(
                 self.webpki.as_ref(),
@@ -1743,14 +2033,7 @@ impl rustls::client::danger::ServerCertVerifier for SeaCoreServerVerifier {
             )?;
         }
 
-        if let Some(expected_pin) = self.pinned_sha256 {
-            let actual = ring::digest::digest(&ring::digest::SHA256, end_entity.as_ref());
-            if actual.as_ref() != expected_pin.as_slice() {
-                return Err(rustls::Error::General(
-                    "server certificate SHA-256 pin mismatch".to_string(),
-                ));
-            }
-        }
+        self.verify_pin(end_entity)?;
 
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
@@ -1916,5 +2199,33 @@ mod tests {
         assert!(setting_ids.contains(&0x06)); // MAX_FIELD_SECTION_SIZE
         assert!(setting_ids.contains(&0x07)); // QPACK_BLOCKED_STREAMS
         assert!(setting_ids.contains(&0x33)); // H3_DATAGRAM
+    }
+
+    #[test]
+    fn spider_path_normalization() {
+        assert_eq!(normalize_spider_path(""), "/");
+        assert_eq!(normalize_spider_path("/"), "/");
+        assert_eq!(normalize_spider_path("status"), "/status");
+        assert_eq!(normalize_spider_path("/status"), "/status");
+    }
+
+    #[test]
+    fn extract_reality_proof_extension_roundtrip() {
+        let expected = vec![0xAB; 32];
+        let mut params = rcgen::CertificateParams::new(vec!["example.com".to_string()])
+            .expect("certificate params");
+        params
+            .custom_extensions
+            .push(rcgen::CustomExtension::from_oid_content(
+                seacore_protocol::reality::REALITY_TEMP_CERT_PROOF_OID,
+                expected.clone(),
+            ));
+
+        let key = rcgen::KeyPair::generate().expect("key pair");
+        let cert = params.self_signed(&key).expect("self-signed cert");
+        let extracted = extract_reality_temp_cert_proof(cert.der().as_ref())
+            .expect("reality proof extension should exist");
+
+        assert_eq!(extracted, expected);
     }
 }

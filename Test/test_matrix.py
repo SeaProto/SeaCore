@@ -513,7 +513,7 @@ def write_config_files(
         "password": password,
         "socks5_listen": f"127.0.0.1:{socks_port}",
         "transport": "auto",
-        "insecure_skip_verify": True,
+        "insecure_skip_verify": False,
         "handshake_timeout_secs": 5,
         "connection_idle_timeout_secs": 10,
         "half_close_timeout_secs": 2,

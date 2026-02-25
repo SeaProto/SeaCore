@@ -1,6 +1,13 @@
 use ring::{aead, hkdf};
 use std::convert::TryInto;
 
+#[derive(Clone, Debug)]
+pub struct TcpRealityAuthContext {
+    pub token: [u8; 32],
+    pub shared_secret: [u8; 32],
+    pub sni: Option<String>,
+}
+
 const QUIC_V1_SALT: [u8; 20] = [
     0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad,
     0xcc, 0xbb, 0x7f, 0x0a,
@@ -590,7 +597,7 @@ pub fn verify_tcp_reality_auth(
     users: &[crate::server::UserConfig],
     short_ids: &[[u8; 8]],
     server_names: &[String],
-) -> Option<[u8; 32]> {
+) -> Option<TcpRealityAuthContext> {
     // 1. Basic TLS Record Layer check
     // ContentType: Handshake (22 or 0x16)
     // Version: Legacy Record Version (0x03 0x01 or 0x03 0x03 usually)
@@ -616,10 +623,12 @@ pub fn verify_tcp_reality_auth(
         }
     };
 
+    let observed_sni = parse_sni(ch);
+
     // Validate SNI against configured server_names (soft check: missing SNI is OK)
     if !server_names.is_empty() {
-        if let Some(sni) = parse_sni(ch) {
-            if !server_names.iter().any(|n| n == &sni) {
+        if let Some(sni) = observed_sni.as_ref() {
+            if !server_names.iter().any(|n| n == sni) {
                 tracing::debug!("verify_tcp_reality_auth: SNI '{}' not in whitelist", sni);
                 return None;
             }
@@ -647,6 +656,8 @@ pub fn verify_tcp_reality_auth(
 
     // Compute original shared secret using Client's Ephemeral Key and Server's Identity Key
     let shared_secret = static_sec.diffie_hellman(&peer_pub);
+    let mut shared_secret_bytes = [0u8; 32];
+    shared_secret_bytes.copy_from_slice(shared_secret.as_bytes());
 
     // 0..8 = timestamp, 8..32 = HMAC(SharedSecret, Timestamp + UUID)
     let mut ts_bytes = [0u8; 8];
@@ -711,7 +722,11 @@ pub fn verify_tcp_reality_auth(
             tracing::debug!("verify_tcp_reality_auth: SUCCESS for user {}", user.uuid);
             let mut token = [0u8; 32];
             token.copy_from_slice(&session_id);
-            return Some(token);
+            return Some(TcpRealityAuthContext {
+                token,
+                shared_secret: shared_secret_bytes,
+                sni: observed_sni,
+            });
         }
     }
 

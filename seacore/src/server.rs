@@ -18,7 +18,9 @@ use uuid::Uuid;
 
 use seacore_protocol::protocol::Address;
 use seacore_protocol::quic::{side, Connection, Task};
-use seacore_protocol::reality::parse_short_id_hex;
+use seacore_protocol::reality::{
+    derive_temp_cert_proof, parse_short_id_hex, REALITY_TEMP_CERT_PROOF_OID,
+};
 
 use crate::auth_limit::AuthRateLimiter;
 use crate::metrics::ServerMetrics;
@@ -167,6 +169,34 @@ impl AsyncWrite for PrefixedTcpStream {
     }
 }
 
+fn build_reality_temporary_tls_config(
+    server_name: &str,
+    shared_secret: &[u8; 32],
+    session_token: &[u8; 32],
+) -> Result<rustls::ServerConfig> {
+    let mut params = rcgen::CertificateParams::new(vec![server_name.to_string()])?;
+    let proof = derive_temp_cert_proof(shared_secret, session_token, server_name);
+    params
+        .custom_extensions
+        .push(rcgen::CustomExtension::from_oid_content(
+            REALITY_TEMP_CERT_PROOF_OID,
+            proof.to_vec(),
+        ));
+
+    let key_pair = rcgen::KeyPair::generate()?;
+    let cert = params.self_signed(&key_pair)?;
+    let cert_der = cert.der().clone();
+    let key_der = rustls::pki_types::PrivateKeyDer::try_from(key_pair.serialize_der())
+        .map_err(|e| eyre::eyre!("failed to parse temporary reality private key: {}", e))?;
+
+    let mut server_crypto = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der)?;
+    server_crypto.alpn_protocols = vec![b"h3".to_vec(), b"h2".to_vec(), b"http/1.1".to_vec()];
+
+    Ok(server_crypto)
+}
+
 pub async fn run_server(config_path: &str) -> Result<()> {
     // Load config
     let config_str = fs::read_to_string(config_path)?;
@@ -239,8 +269,6 @@ pub async fn run_server(config_path: &str) -> Result<()> {
         .with_no_client_auth()
         .with_single_cert(vec![cert_der], key_der)?;
     server_crypto.alpn_protocols = vec![b"h3".to_vec(), b"h2".to_vec(), b"http/1.1".to_vec()];
-
-    let server_crypto_clone = server_crypto.clone();
 
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)?,
@@ -380,7 +408,6 @@ pub async fn run_server(config_path: &str) -> Result<()> {
                                 let users = users_clone.clone();
                                 let s_ids = short_ids_clone.clone();
                                 let s_names = server_names_clone.clone();
-                                let server_crypto_inner = server_crypto_clone.clone();
                                 let config_inner = config_clone_for_tcp.clone();
                                 let idle_policy_inner = idle_policy_clone_for_tcp.clone();
                                 let session_policy_inner = session_policy_clone_for_tcp.clone();
@@ -448,7 +475,7 @@ pub async fn run_server(config_path: &str) -> Result<()> {
 
                                     server_metrics_inner.inc_reality_request();
 
-                                    let auth_token = if is_tls_handshake {
+                                    let auth_context = if is_tls_handshake {
                                         crate::sniffer::verify_tcp_reality_auth(
                                             &sniffed, &priv_key, &users, &s_ids, &s_names,
                                         )
@@ -456,9 +483,10 @@ pub async fn run_server(config_path: &str) -> Result<()> {
                                         None
                                     };
 
-                                    let is_authenticated = if let Some(token) = auth_token {
+                                    let is_authenticated = if let Some(auth) = auth_context.as_ref()
+                                    {
                                         let mut replay_cache = tcp_replay_cache_inner.lock().await;
-                                        if replay_cache.check_and_insert(token) {
+                                        if replay_cache.check_and_insert(auth.token) {
                                             warn!(
                                                 "TCP replay attack detected from {}, rejecting",
                                                 client_addr
@@ -486,6 +514,41 @@ pub async fn run_server(config_path: &str) -> Result<()> {
 
                                     if is_authenticated {
                                         debug!("TCP REALITY auth accepted for {}", client_addr);
+                                        let Some(auth) = auth_context.as_ref() else {
+                                            warn!(
+                                                "TCP REALITY auth context missing for {}",
+                                                client_addr
+                                            );
+                                            return;
+                                        };
+
+                                        let cert_name = auth
+                                            .sni
+                                            .as_deref()
+                                            .filter(|name| {
+                                                s_names.iter().any(|allowed| allowed == *name)
+                                            })
+                                            .or_else(|| s_names.first().map(|s| s.as_str()))
+                                            .unwrap_or("localhost")
+                                            .to_string();
+
+                                        let server_crypto_inner =
+                                            match build_reality_temporary_tls_config(
+                                                &cert_name,
+                                                &auth.shared_secret,
+                                                &auth.token,
+                                            ) {
+                                                Ok(cfg) => cfg,
+                                                Err(e) => {
+                                                    warn!(
+                                                        "Failed to build temporary REALITY certificate for {}: {}",
+                                                        client_addr,
+                                                        e
+                                                    );
+                                                    return;
+                                                }
+                                            };
+
                                         let acceptor = tokio_rustls::TlsAcceptor::from(
                                             std::sync::Arc::new(server_crypto_inner),
                                         );

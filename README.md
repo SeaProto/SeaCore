@@ -94,13 +94,15 @@ To start the client, you need a corresponding `client.json` with the matching `p
         "profile": "chrome",
         "server_name": "www.apple.com",
         "public_key": "base64_encoded_public_key_here",
-        "short_id": "0011223344556677"
+        "short_id": "0011223344556677",
+        "spider_x": "/"
     }
 }
 ```
 
 `insecure_skip_verify` is disabled by default and should remain `false` in production.
-For self-signed deployments, prefer using `server_cert_sha256` pinning instead of disabling verification.
+When `reality` is enabled, SeaCore verifies temporary trusted certificates with a REALITY proof extension and enters spider mode if a real-site certificate is observed.
+For non-REALITY deployments, prefer using `server_cert_sha256` pinning instead of disabling verification.
 
 Start the client process:
 ```bash
