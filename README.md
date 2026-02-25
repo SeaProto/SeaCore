@@ -212,4 +212,4 @@ python Test/test_matrix.py --skip-long --skip-reconnect
 
 ## Warning
 > Most of this project's code was written by AI and may contain security issues. Please use it with caution.  
-> AI models used: Gemini, Claude
+> AI models used: Gemini, Claude, OpenAI
