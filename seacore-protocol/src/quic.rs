@@ -5,15 +5,15 @@ use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use quinn::{
-    Connection as QuinnConnection, ConnectionError, RecvStream, SendDatagramError, SendStream,
-    ClosedStream, ReadExactError,
+    ClosedStream, Connection as QuinnConnection, ConnectionError, ReadExactError, RecvStream,
+    SendDatagramError, SendStream,
 };
+use std::sync::Arc;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tracing::warn;
 use uuid::Uuid;
-use std::sync::Arc;
 
 use crate::model::{AssembleError, Connection as ConnectionModel, KeyingMaterialExporter as KME};
 use crate::protocol::{Address, Header};
@@ -49,7 +49,12 @@ pub struct Connection<Side> {
 impl<Side> Connection<Side> {
     /// Sends a `Packet` using QUIC datagram (native mode, low latency)
     /// Over TCP, falls back to `packet_stream` natively
-    pub async fn packet_native(&self, pkt: impl AsRef<[u8]>, addr: Address, assoc_id: u16) -> Result<(), Error> {
+    pub async fn packet_native(
+        &self,
+        pkt: impl AsRef<[u8]>,
+        addr: Address,
+        assoc_id: u16,
+    ) -> Result<(), Error> {
         match &self.conn {
             InnerConn::Quic(q) => {
                 let Some(max_pkt_size) = q.max_datagram_size() else {
@@ -73,7 +78,12 @@ impl<Side> Connection<Side> {
     }
 
     /// Sends a `Packet` using QUIC uni-stream (reliable mode) or over the shared TCP stream
-    pub async fn packet_stream(&self, pkt: impl AsRef<[u8]>, addr: Address, assoc_id: u16) -> Result<(), Error> {
+    pub async fn packet_stream(
+        &self,
+        pkt: impl AsRef<[u8]>,
+        addr: Address,
+        assoc_id: u16,
+    ) -> Result<(), Error> {
         let sender = self.model.send_packet(assoc_id, addr, u16::MAX as usize);
         for (header, frag) in sender.into_fragments(pkt.as_ref()) {
             match &self.conn {
@@ -82,7 +92,9 @@ impl<Side> Connection<Side> {
                     header.async_marshal(&mut send).await?;
                     send.write_all(frag).await?;
                     match send {
-                        SeaCoreWriteStream::Quic(mut q) => q.finish().map_err(|e| Error::StreamClosed(e))?,
+                        SeaCoreWriteStream::Quic(mut q) => {
+                            q.finish().map_err(|e| Error::StreamClosed(e))?
+                        }
                         SeaCoreWriteStream::Tcp(_) => {}
                     }
                 }
@@ -167,7 +179,9 @@ impl Connection<side::Client> {
     /// Sends an `Authenticate` command via uni-stream or TCP
     pub async fn authenticate(&self, uuid: Uuid, password: impl AsRef<[u8]>) -> Result<(), Error> {
         let exporter_opt = self.keying_material_exporter();
-        let auth_data = self.model.send_authenticate(uuid, password, exporter_opt.as_ref()); 
+        let auth_data = self
+            .model
+            .send_authenticate(uuid, password, exporter_opt.as_ref());
         let header = Header::Authenticate(auth_data);
         match &self.conn {
             InnerConn::Quic(q) => {
@@ -195,11 +209,14 @@ impl Connection<side::Client> {
                 let mut sc_send = SeaCoreWriteStream::Quic(send);
                 let sc_recv = SeaCoreReadStream::Quic(recv);
                 header.async_marshal(&mut sc_send).await?;
-                Ok(BiStream { send: sc_send, recv: sc_recv })
+                Ok(BiStream {
+                    send: sc_send,
+                    recv: sc_recv,
+                })
             }
-            InnerConn::Tcp(_) => {
-                Err(Error::BadCommand("Connect over multiplexed TCP not yet supported natively in this interface".into()))
-            }
+            InnerConn::Tcp(_) => Err(Error::BadCommand(
+                "Connect over multiplexed TCP not yet supported natively in this interface".into(),
+            )),
         }
     }
 
@@ -243,7 +260,10 @@ impl Connection<side::Client> {
     }
 
     /// Parse a continuous TCP stream as SeaCore commands
-    pub async fn next_tcp_task(&self, recv: &mut (dyn tokio::io::AsyncRead + Unpin + Send)) -> Result<Task, Error> {
+    pub async fn next_tcp_task(
+        &self,
+        recv: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+    ) -> Result<Task, Error> {
         let header = Header::async_unmarshal(recv)
             .await
             .map_err(|e| Error::UnmarshalStream(e))?;
@@ -266,7 +286,10 @@ impl Connection<side::Client> {
                 timestamp: ping.timestamp(),
             }),
             Header::Dissociate(diss) => Ok(Task::Dissociate(diss.assoc_id())),
-            other => Err(Error::BadCommand(format!("{} on next_tcp_task_client", other))),
+            other => Err(Error::BadCommand(format!(
+                "{} on next_tcp_task_client",
+                other
+            ))),
         }
     }
 }
@@ -315,7 +338,11 @@ impl Connection<side::Server> {
     }
 
     /// Parse a bi-stream as a SeaCore command
-    pub async fn accept_bi_stream(&self, send: SeaCoreWriteStream, mut recv: SeaCoreReadStream) -> Result<Task, Error> {
+    pub async fn accept_bi_stream(
+        &self,
+        send: SeaCoreWriteStream,
+        mut recv: SeaCoreReadStream,
+    ) -> Result<Task, Error> {
         let header = Header::async_unmarshal(&mut recv)
             .await
             .map_err(|e| Error::UnmarshalStream(e))?;
@@ -339,17 +366,15 @@ impl Connection<side::Server> {
         password: impl AsRef<[u8]>,
     ) -> bool {
         let exporter_opt = self.keying_material_exporter();
-        self.model.validate_authenticate(
-            uuid,
-            timestamp,
-            token,
-            password,
-            exporter_opt.as_ref(),
-        )
+        self.model
+            .validate_authenticate(uuid, timestamp, token, password, exporter_opt.as_ref())
     }
 
     /// Parse a continuous TCP stream as SeaCore commands
-    pub async fn next_tcp_task(&self, recv: &mut (dyn tokio::io::AsyncRead + Unpin + Send)) -> Result<Task, Error> {
+    pub async fn next_tcp_task(
+        &self,
+        recv: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+    ) -> Result<Task, Error> {
         let header = Header::async_unmarshal(recv)
             .await
             .map_err(|e| Error::UnmarshalStream(e))?;
@@ -388,12 +413,18 @@ impl Connection<side::Server> {
                 let addr = conn.addr().clone();
                 // In TCP 1:1 mode, the BiStream is handled by the caller.
                 // We return empty placeholders for now.
-                Ok(Task::Connect(BiStream {
-                    send: SeaCoreWriteStream::Tcp(Box::new(tokio::io::sink())),
-                    recv: SeaCoreReadStream::Tcp(Box::new(tokio::io::empty())),
-                }, addr))
+                Ok(Task::Connect(
+                    BiStream {
+                        send: SeaCoreWriteStream::Tcp(Box::new(tokio::io::sink())),
+                        recv: SeaCoreReadStream::Tcp(Box::new(tokio::io::empty())),
+                    },
+                    addr,
+                ))
             }
-            other => Err(Error::BadCommand(format!("{} on next_tcp_task_server", other))),
+            other => Err(Error::BadCommand(format!(
+                "{} on next_tcp_task_server",
+                other
+            ))),
         }
     }
 }
@@ -402,8 +433,7 @@ impl<Side> Connection<Side> {
     /// Parse a QUIC datagram as a SeaCore command
     pub fn accept_datagram(&self, dg: Bytes) -> Result<Task, Error> {
         let mut cursor = Cursor::new(dg.clone());
-        let header = Header::unmarshal(&mut cursor)
-            .map_err(|e| Error::UnmarshalDatagram(e))?;
+        let header = Header::unmarshal(&mut cursor).map_err(|e| Error::UnmarshalDatagram(e))?;
 
         match header {
             Header::Packet(pkt) => {
@@ -462,21 +492,27 @@ impl AsyncWrite for SeaCoreWriteStream {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         match self.get_mut() {
-            SeaCoreWriteStream::Quic(ref mut w) => Pin::new(w).poll_write(cx, buf).map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e)),
+            SeaCoreWriteStream::Quic(ref mut w) => Pin::new(w)
+                .poll_write(cx, buf)
+                .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e)),
             SeaCoreWriteStream::Tcp(ref mut w) => Pin::new(w).poll_write(cx, buf),
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
-            SeaCoreWriteStream::Quic(ref mut w) => Pin::new(w).poll_flush(cx).map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e)),
+            SeaCoreWriteStream::Quic(ref mut w) => Pin::new(w)
+                .poll_flush(cx)
+                .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e)),
             SeaCoreWriteStream::Tcp(ref mut w) => Pin::new(w).poll_flush(cx),
         }
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
-            SeaCoreWriteStream::Quic(ref mut w) => Pin::new(w).poll_shutdown(cx).map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e)),
+            SeaCoreWriteStream::Quic(ref mut w) => Pin::new(w)
+                .poll_shutdown(cx)
+                .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e)),
             SeaCoreWriteStream::Tcp(ref mut w) => Pin::new(w).poll_shutdown(cx),
         }
     }
@@ -489,13 +525,21 @@ pub struct BiStream {
 }
 
 impl AsyncRead for BiStream {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         AsyncRead::poll_read(Pin::new(&mut self.get_mut().recv), cx, buf)
     }
 }
 
 impl AsyncWrite for BiStream {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         AsyncWrite::poll_write(Pin::new(&mut self.get_mut().send), cx, buf)
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -600,7 +644,10 @@ impl PacketTask {
     }
 }
 
-async fn req_ext_read_exact<T: AsyncRead + Unpin>(mut stream: T, buf: &mut [u8]) -> Result<(), Error> {
+async fn req_ext_read_exact<T: AsyncRead + Unpin>(
+    mut stream: T,
+    buf: &mut [u8],
+) -> Result<(), Error> {
     tokio::io::AsyncReadExt::read_exact(&mut stream, buf).await?;
     Ok(())
 }

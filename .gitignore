@@ -30,3 +30,8 @@ tuic
 tuic-rust
 Xray-core
 anytls-go
+todo.md
+
+# Python cache
+**/__pycache__/
+*.pyc

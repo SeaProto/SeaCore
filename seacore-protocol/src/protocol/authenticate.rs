@@ -25,7 +25,11 @@ impl Authenticate {
     const TYPE_CODE: u8 = 0x00;
 
     pub const fn new(uuid: Uuid, timestamp: u64, token: [u8; 32]) -> Self {
-        Self { uuid, timestamp, token }
+        Self {
+            uuid,
+            timestamp,
+            token,
+        }
     }
 
     pub fn uuid(&self) -> Uuid {

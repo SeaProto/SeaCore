@@ -7,6 +7,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{watch, Mutex};
 use tracing::{debug, info, warn};
 
+use crate::auth_limit::AuthRateLimiter;
 use crate::sniffer;
 
 enum SessionTarget {
@@ -37,7 +38,9 @@ struct ReplayCache {
 
 impl ReplayCache {
     fn new() -> Self {
-        Self { seen: HashMap::new() }
+        Self {
+            seen: HashMap::new(),
+        }
     }
 
     /// Returns `true` if the token was already seen (replay detected).
@@ -64,9 +67,10 @@ pub struct QuicRouter {
     sessions: Arc<Mutex<HashMap<SocketAddr, SessionEntry>>>,
     server_priv_key: [u8; 32],
     users: Vec<crate::server::UserConfig>,
-    short_ids: Vec<String>,
+    short_ids: Vec<[u8; 8]>,
     server_names: Vec<String>,
     replay_cache: Arc<Mutex<ReplayCache>>,
+    auth_limiter: Arc<Mutex<AuthRateLimiter>>,
 }
 
 impl QuicRouter {
@@ -76,7 +80,7 @@ impl QuicRouter {
         fallback_addr: SocketAddr,
         server_priv_key: [u8; 32],
         users: Vec<crate::server::UserConfig>,
-        short_ids: Vec<String>,
+        short_ids: Vec<[u8; 8]>,
         server_names: Vec<String>,
     ) -> Result<Self> {
         let public_listener = Arc::new(UdpSocket::bind(listen_addr).await?);
@@ -95,6 +99,7 @@ impl QuicRouter {
             short_ids,
             server_names,
             replay_cache: Arc::new(Mutex::new(ReplayCache::new())),
+            auth_limiter: Arc::new(Mutex::new(AuthRateLimiter::default())),
         })
     }
 
@@ -114,7 +119,9 @@ impl QuicRouter {
                     let stale: Vec<SocketAddr> = sessions
                         .iter()
                         .filter_map(|(addr, entry)| {
-                            if now.saturating_duration_since(entry.last_seen) >= SESSION_IDLE_TIMEOUT {
+                            if now.saturating_duration_since(entry.last_seen)
+                                >= SESSION_IDLE_TIMEOUT
+                            {
                                 Some(*addr)
                             } else {
                                 None
@@ -190,13 +197,16 @@ impl QuicRouter {
                 // Check replay cache
                 let mut cache = self.replay_cache.lock().await;
                 if cache.check_and_insert(token) {
-                    warn!("Replay attack detected from {}, rejecting", client_addr);
+                    warn!(
+                        "Replay attack detected from {}, routing to fallback",
+                        client_addr
+                    );
                     false
                 } else {
                     true
                 }
             } else {
-                // If it's not a valid initial Auth packet, it might be an ongoing connection 
+                // If it's not a valid initial Auth packet, it might be an ongoing connection
                 // from before a server restart (short header packet).
                 // Let's forward short headers to Quinn so Quinn can issue a Stateless Reset.
                 // A short header in QUIC v1 starts with a 0 bit (so 0x80 bit is not set).
@@ -207,11 +217,22 @@ impl QuicRouter {
                 }
             };
 
+            let auth_delay = {
+                let mut limiter = self.auth_limiter.lock().await;
+                limiter.delay_for_attempt(client_addr.ip(), is_valid)
+            };
+            if !auth_delay.is_zero() {
+                tokio::time::sleep(auth_delay).await;
+            }
+
             let target_addr = if is_valid {
-                info!("Reality QUIC Auth successful for {}", client_addr);
+                debug!("Reality QUIC auth accepted for {}", client_addr);
                 self.quinn_addr
             } else {
-                info!("Reality QUIC Auth failed for {}, routing to fallback", client_addr);
+                debug!(
+                    "Reality QUIC auth rejected for {}, routing fallback",
+                    client_addr
+                );
                 self.fallback_addr
             };
 
@@ -224,10 +245,13 @@ impl QuicRouter {
             };
             let local_sock = Arc::new(UdpSocket::bind(bind_addr).await?);
             local_sock.connect(target_addr).await?;
-            
+
             // Forward the first packet
             if let Err(e) = local_sock.send(packet).await {
-                warn!("Failed to forward initial packet for {}: {}", client_addr, e);
+                warn!(
+                    "Failed to forward initial packet for {}: {}",
+                    client_addr, e
+                );
                 continue;
             }
 

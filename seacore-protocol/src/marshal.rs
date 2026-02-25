@@ -20,7 +20,10 @@ impl Header {
     }
 
     /// Async write the header to an AsyncWrite stream
-    pub async fn async_marshal(&self, writer: &mut (impl tokio::io::AsyncWriteExt + Unpin)) -> std::io::Result<()> {
+    pub async fn async_marshal(
+        &self,
+        writer: &mut (impl tokio::io::AsyncWriteExt + Unpin),
+    ) -> std::io::Result<()> {
         let mut buf = Vec::with_capacity(self.len());
         self.write(&mut buf);
         writer.write_all(&buf).await

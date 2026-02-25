@@ -1,23 +1,24 @@
 $ErrorActionPreference = "Stop"
 
-taskkill /IM seacore.exe /F 2>$null
-Start-Sleep -Seconds 2
+$repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
+$matrixScript = Join-Path $PSScriptRoot "test_matrix.py"
 
-$env:RUST_LOG="info"
+Push-Location $repoRoot
+try {
+    Write-Host "Building release binary..."
+    cargo build --release -p seacore
 
-Write-Output "Starting Server..."
-Start-Process -FilePath ".\seacore.exe" -ArgumentList "server","--config","server.json" -NoNewWindow
-Start-Sleep -Seconds 2
+    $py = Get-Command py -ErrorAction SilentlyContinue
+    if ($py) {
+        & py -3 $matrixScript @args
+    } else {
+        & python $matrixScript @args
+    }
 
-Write-Output "Starting Client..."
-Start-Process -FilePath ".\seacore.exe" -ArgumentList "client","--config","client.json" -NoNewWindow
-Start-Sleep -Seconds 4
-
-Write-Output "=== TCP PROXY TEST ==="
-curl -x socks5h://127.0.0.1:10800 -I https://www.baidu.com --connect-timeout 10 2>&1
-
-Write-Output "`n=== UDP PROXY TEST ==="
-python test_udp_proxy.py 2>&1
-
-Start-Sleep -Seconds 10
-Write-Output "=== Test completed ==="
+    if ($LASTEXITCODE -ne 0) {
+        throw "SeaCore matrix failed with exit code $LASTEXITCODE"
+    }
+}
+finally {
+    Pop-Location
+}

@@ -1,14 +1,14 @@
+use std::cmp::Reverse;
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::collections::HashMap;
-use std::cmp::Reverse;
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::sync::{Mutex, Semaphore};
 
 use eyre::Result;
 use quinn::Endpoint;
@@ -17,9 +17,12 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use seacore_protocol::protocol::Address;
-use seacore_protocol::quic::{
-    side, Connection, Task,
-};
+use seacore_protocol::quic::{side, Connection, Task};
+use seacore_protocol::reality::parse_short_id_hex;
+
+use crate::auth_limit::AuthRateLimiter;
+use crate::metrics::ServerMetrics;
+use crate::session_policy::SessionGovernancePolicy;
 
 #[derive(Deserialize, Clone)]
 pub struct ServerConfig {
@@ -27,11 +30,19 @@ pub struct ServerConfig {
     pub users: Vec<UserConfig>,
     pub congestion_control: Option<String>,
     pub max_idle_time_secs: Option<u64>,
+    pub connection_idle_timeout_secs: Option<u64>,
+    pub handshake_timeout_secs: Option<u64>,
+    pub half_close_timeout_secs: Option<u64>,
     #[allow(dead_code)]
     pub max_udp_relay_packet_size: Option<usize>,
     pub idle_session_check_interval_secs: Option<u64>,
     pub idle_session_timeout_secs: Option<u64>,
     pub min_idle_sessions: Option<usize>,
+    pub max_quic_connections: Option<usize>,
+    pub max_tcp_connections: Option<usize>,
+    pub max_udp_associations_per_connection: Option<usize>,
+    pub max_bi_stream_tasks_per_connection: Option<usize>,
+    pub metrics_listen: Option<SocketAddr>,
     pub reality: Option<RealityServerSettings>,
 }
 
@@ -65,6 +76,40 @@ fn idle_session_policy_from_server_config(config: &ServerConfig) -> IdleSessionP
         check_interval: Duration::from_secs(check_secs),
         timeout: Duration::from_secs(timeout_secs),
         min_idle_sessions,
+    }
+}
+
+const DEFAULT_MAX_QUIC_CONNECTIONS: usize = 1024;
+const DEFAULT_MAX_TCP_CONNECTIONS: usize = 1024;
+const DEFAULT_MAX_UDP_ASSOCIATIONS_PER_CONNECTION: usize = 1024;
+const DEFAULT_MAX_BI_STREAM_TASKS_PER_CONNECTION: usize = 256;
+
+/// Cache of recently seen REALITY auth tokens for replay protection.
+/// Tokens are valid for ±30s, so we evict entries older than 120s.
+struct ReplayCache {
+    seen: HashMap<[u8; 32], Instant>,
+}
+
+impl ReplayCache {
+    fn new() -> Self {
+        Self {
+            seen: HashMap::new(),
+        }
+    }
+
+    fn check_and_insert(&mut self, token: [u8; 32]) -> bool {
+        self.evict_stale();
+        if self.seen.contains_key(&token) {
+            true
+        } else {
+            self.seen.insert(token, Instant::now());
+            false
+        }
+    }
+
+    fn evict_stale(&mut self) {
+        let cutoff = Instant::now() - Duration::from_secs(120);
+        self.seen.retain(|_, ts| *ts > cutoff);
     }
 }
 
@@ -127,6 +172,28 @@ pub async fn run_server(config_path: &str) -> Result<()> {
     let config_str = fs::read_to_string(config_path)?;
     let config: ServerConfig = serde_json::from_str(&config_str)?;
     let idle_policy = Arc::new(idle_session_policy_from_server_config(&config));
+    let session_policy = Arc::new(SessionGovernancePolicy::from_config(
+        config.handshake_timeout_secs,
+        config.connection_idle_timeout_secs,
+        config.max_idle_time_secs,
+        config.half_close_timeout_secs,
+    ));
+    let max_quic_connections = config
+        .max_quic_connections
+        .unwrap_or(DEFAULT_MAX_QUIC_CONNECTIONS)
+        .max(1);
+    let max_tcp_connections = config
+        .max_tcp_connections
+        .unwrap_or(DEFAULT_MAX_TCP_CONNECTIONS)
+        .max(1);
+    let max_udp_associations_per_connection = config
+        .max_udp_associations_per_connection
+        .unwrap_or(DEFAULT_MAX_UDP_ASSOCIATIONS_PER_CONNECTION)
+        .max(1);
+    let max_bi_stream_tasks_per_connection = config
+        .max_bi_stream_tasks_per_connection
+        .unwrap_or(DEFAULT_MAX_BI_STREAM_TASKS_PER_CONNECTION)
+        .max(1);
 
     info!("Listening on {}", config.listen);
     info!("Loaded {} user(s)", config.users.len());
@@ -136,6 +203,24 @@ pub async fn run_server(config_path: &str) -> Result<()> {
         idle_policy.timeout.as_secs(),
         idle_policy.min_idle_sessions
     );
+    info!(
+        "Limits: quic_conn={} tcp_conn={} udp_assoc_per_conn={} bi_tasks_per_conn={}",
+        max_quic_connections,
+        max_tcp_connections,
+        max_udp_associations_per_connection,
+        max_bi_stream_tasks_per_connection
+    );
+    info!(
+        "Session governance: handshake={}s conn_idle={}s half_close={}s",
+        session_policy.handshake_timeout.as_secs(),
+        session_policy.connection_idle_timeout.as_secs(),
+        session_policy.half_close_timeout.as_secs()
+    );
+
+    let metrics = Arc::new(ServerMetrics::default());
+    if let Some(metrics_listen) = config.metrics_listen {
+        crate::metrics::spawn_server_exporter(metrics_listen, metrics.clone());
+    }
 
     // Generate certificate. In Reality, we borrow the certificate of the dest host.
     // Here we generate a self-signed one with the borrowed names.
@@ -173,30 +258,29 @@ pub async fn run_server(config_path: &str) -> Result<()> {
     transport_config.min_mtu(1200);
     // Note: quinn 0.11 enables grease_quic_bit by default (RFC 9287)
 
-    if let Some(secs) = config.max_idle_time_secs {
-        if let Ok(timeout) = std::time::Duration::from_secs(secs).try_into() {
-            transport_config.max_idle_timeout(Some(timeout));
-        }
-    } else {
-        if let Ok(timeout) = std::time::Duration::from_secs(10).try_into() {
-            transport_config.max_idle_timeout(Some(timeout));
-        }
+    if let Ok(timeout) = session_policy.connection_idle_timeout.try_into() {
+        transport_config.max_idle_timeout(Some(timeout));
     }
-    
+
     if let Some(cc) = &config.congestion_control {
         match cc.to_lowercase().as_str() {
             "bbr" => {
-                transport_config.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+                transport_config.congestion_controller_factory(Arc::new(
+                    quinn::congestion::BbrConfig::default(),
+                ));
             }
             "cubic" => {} // Default
-            _ => warn!("Unknown congestion control algorithm: {}, using default", cc),
+            _ => warn!(
+                "Unknown congestion control algorithm: {}, using default",
+                cc
+            ),
         }
     }
-    
+
     server_config.transport_config(Arc::new(transport_config));
 
     let endpoint = if let Some(reality) = &config.reality {
-        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
         let mut server_priv_key = [0u8; 32];
         let priv_b64 = reality.private_key.as_str();
         if let Ok(decoded) = STANDARD.decode(priv_b64) {
@@ -216,9 +300,18 @@ pub async fn run_server(config_path: &str) -> Result<()> {
         // Resolve fallback addr
         let fallback_str = &reality.dest;
         let mut fallback_addrs = tokio::net::lookup_host(fallback_str).await?;
-        let fallback_addr = fallback_addrs.next().unwrap_or_else(|| "127.0.0.1:443".parse().expect("constant socket addr"));
+        let fallback_addr = fallback_addrs
+            .next()
+            .unwrap_or_else(|| "127.0.0.1:443".parse().expect("constant socket addr"));
 
-        let short_ids = reality.short_ids.clone();
+        let short_ids: Vec<[u8; 8]> = reality
+            .short_ids
+            .iter()
+            .map(|raw| {
+                parse_short_id_hex(raw)
+                    .map_err(|e| eyre::eyre!("invalid reality.short_ids entry '{}': {}", raw, e))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let server_names = reality.server_names.clone();
 
         let router = crate::router::QuicRouter::new(
@@ -227,20 +320,21 @@ pub async fn run_server(config_path: &str) -> Result<()> {
             fallback_addr,
             server_priv_key,
             config.users.clone(),
-            short_ids,
+            short_ids.clone(),
             server_names,
-        ).await?;
+        )
+        .await?;
 
         tokio::spawn(async move {
             if let Err(e) = router.run().await {
                 error!("Router error: {}", e);
             }
         });
-        
+
         // --- Phase 19: TCP REALITY Proxy Channel & Fallback ---
         let tcp_listen_addr = config.listen;
         let dest_str = reality.dest.clone();
-        
+
         let mut server_priv_key_copy = [0u8; 32];
         let priv_b64 = reality.private_key.as_str();
         if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(priv_b64) {
@@ -249,11 +343,16 @@ pub async fn run_server(config_path: &str) -> Result<()> {
             }
         }
         let users_clone = config.users.clone();
-        let short_ids_clone = reality.short_ids.clone();
+        let short_ids_clone = short_ids.clone();
         let server_names_clone = reality.server_names.clone();
 
         let config_clone_for_tcp = config.clone();
         let idle_policy_clone_for_tcp = idle_policy.clone();
+        let session_policy_clone_for_tcp = session_policy.clone();
+        let tcp_connection_limiter = Arc::new(Semaphore::new(max_tcp_connections));
+        let tcp_replay_cache = Arc::new(Mutex::new(ReplayCache::new()));
+        let tcp_auth_limiter = Arc::new(Mutex::new(AuthRateLimiter::default()));
+        let server_metrics = metrics.clone();
 
         tokio::spawn(async move {
             match tokio::net::TcpListener::bind(tcp_listen_addr).await {
@@ -262,6 +361,20 @@ pub async fn run_server(config_path: &str) -> Result<()> {
                     loop {
                         match listener.accept().await {
                             Ok((client_stream, client_addr)) => {
+                                let permit = match tcp_connection_limiter
+                                    .clone()
+                                    .try_acquire_owned()
+                                {
+                                    Ok(permit) => permit,
+                                    Err(_) => {
+                                        warn!(
+                                            "Dropping TCP REALITY connection from {} because max_tcp_connections={} was reached",
+                                            client_addr,
+                                            max_tcp_connections
+                                        );
+                                        continue;
+                                    }
+                                };
                                 let dest = dest_str.clone();
                                 let priv_key = server_priv_key_copy.clone();
                                 let users = users_clone.clone();
@@ -270,8 +383,13 @@ pub async fn run_server(config_path: &str) -> Result<()> {
                                 let server_crypto_inner = server_crypto_clone.clone();
                                 let config_inner = config_clone_for_tcp.clone();
                                 let idle_policy_inner = idle_policy_clone_for_tcp.clone();
+                                let session_policy_inner = session_policy_clone_for_tcp.clone();
+                                let tcp_replay_cache_inner = tcp_replay_cache.clone();
+                                let tcp_auth_limiter_inner = tcp_auth_limiter.clone();
+                                let server_metrics_inner = server_metrics.clone();
 
                                 tokio::spawn(async move {
+                                    let _permit = permit;
                                     // Read initial bytes once (event-driven, no spin/peek polling).
                                     // We keep consumed bytes and replay them into TLS acceptor/fallback.
                                     let mut client_stream = client_stream;
@@ -279,7 +397,8 @@ pub async fn run_server(config_path: &str) -> Result<()> {
                                     let mut chunk = [0u8; 4096];
                                     let mut need_len = 5usize;
                                     let mut is_tls_handshake = false;
-                                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                                    let deadline = std::time::Instant::now()
+                                        + session_policy_inner.handshake_timeout;
 
                                     loop {
                                         if sniffed.len() >= need_len || sniffed.len() >= 20000 {
@@ -290,7 +409,12 @@ pub async fn run_server(config_path: &str) -> Result<()> {
                                             break;
                                         }
                                         let remain = deadline.saturating_duration_since(now);
-                                        let n = match tokio::time::timeout(remain, client_stream.read(&mut chunk)).await {
+                                        let n = match tokio::time::timeout(
+                                            remain,
+                                            client_stream.read(&mut chunk),
+                                        )
+                                        .await
+                                        {
                                             Ok(Ok(n)) => n,
                                             _ => break,
                                         };
@@ -302,7 +426,9 @@ pub async fn run_server(config_path: &str) -> Result<()> {
                                         if sniffed.len() >= 5 {
                                             if sniffed[0] == 0x16 {
                                                 is_tls_handshake = true;
-                                                let record_len = u16::from_be_bytes([sniffed[3], sniffed[4]]) as usize;
+                                                let record_len =
+                                                    u16::from_be_bytes([sniffed[3], sniffed[4]])
+                                                        as usize;
                                                 let total = 5 + record_len;
                                                 if total <= 20000 {
                                                     need_len = total;
@@ -320,48 +446,142 @@ pub async fn run_server(config_path: &str) -> Result<()> {
                                         return;
                                     }
 
-                                    let is_authenticated = is_tls_handshake
-                                        && crate::sniffer::verify_tcp_reality_auth(
-                                            &sniffed,
-                                            &priv_key,
-                                            &users,
-                                            &s_ids,
-                                            &s_names,
-                                        )
-                                        .is_some();
+                                    server_metrics_inner.inc_reality_request();
 
-                                    let wrapped_stream = PrefixedTcpStream::new(sniffed, client_stream);
+                                    let auth_token = if is_tls_handshake {
+                                        crate::sniffer::verify_tcp_reality_auth(
+                                            &sniffed, &priv_key, &users, &s_ids, &s_names,
+                                        )
+                                    } else {
+                                        None
+                                    };
+
+                                    let is_authenticated = if let Some(token) = auth_token {
+                                        let mut replay_cache = tcp_replay_cache_inner.lock().await;
+                                        if replay_cache.check_and_insert(token) {
+                                            warn!(
+                                                "TCP replay attack detected from {}, rejecting",
+                                                client_addr
+                                            );
+                                            false
+                                        } else {
+                                            true
+                                        }
+                                    } else {
+                                        false
+                                    };
+                                    server_metrics_inner.record_auth_attempt(is_authenticated);
+
+                                    let auth_delay = {
+                                        let mut limiter = tcp_auth_limiter_inner.lock().await;
+                                        limiter
+                                            .delay_for_attempt(client_addr.ip(), is_authenticated)
+                                    };
+                                    if !auth_delay.is_zero() {
+                                        tokio::time::sleep(auth_delay).await;
+                                    }
+
+                                    let wrapped_stream =
+                                        PrefixedTcpStream::new(sniffed, client_stream);
 
                                     if is_authenticated {
-                                        info!("TCP REALITY Authentication SUCCESS from {} (Routing)", client_addr);
-                                        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_crypto_inner));
-                                        match acceptor.accept(wrapped_stream).await {
-                                            Ok(tls_stream) => {
+                                        debug!("TCP REALITY auth accepted for {}", client_addr);
+                                        let acceptor = tokio_rustls::TlsAcceptor::from(
+                                            std::sync::Arc::new(server_crypto_inner),
+                                        );
+                                        match tokio::time::timeout(
+                                            session_policy_inner.handshake_timeout,
+                                            acceptor.accept(wrapped_stream),
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok(tls_stream)) => {
                                                 let (r, w) = tokio::io::split(tls_stream);
-                                                let inner = seacore_protocol::quic::InnerConn::Tcp(std::sync::Arc::new(tokio::sync::Mutex::new(Box::new(w))));
-                                                let seacore_conn = seacore_protocol::quic::Connection::<seacore_protocol::quic::side::Server>::new(inner);
+                                                let inner = seacore_protocol::quic::InnerConn::Tcp(
+                                                    std::sync::Arc::new(tokio::sync::Mutex::new(
+                                                        Box::new(w),
+                                                    )),
+                                                );
+                                                let seacore_conn =
+                                                    seacore_protocol::quic::Connection::<
+                                                        seacore_protocol::quic::side::Server,
+                                                    >::new(
+                                                        inner
+                                                    );
                                                 let config_for_tcp = config_inner;
+                                                let max_udp_assocs =
+                                                    max_udp_associations_per_connection;
+                                                let session_policy_for_tcp =
+                                                    session_policy_inner.clone();
 
                                                 tokio::spawn(async move {
-                                                    if let Err(e) = handle_tcp_connection(seacore_conn, Box::new(r), config_for_tcp, idle_policy_inner.clone()).await {
+                                                    if let Err(e) = handle_tcp_connection(
+                                                        seacore_conn,
+                                                        Box::new(r),
+                                                        config_for_tcp,
+                                                        idle_policy_inner.clone(),
+                                                        session_policy_for_tcp,
+                                                        max_udp_assocs,
+                                                        server_metrics_inner.clone(),
+                                                    )
+                                                    .await
+                                                    {
                                                         warn!("TCP connection error handling failed: {}", e);
                                                     }
                                                 });
                                             }
-                                            Err(e) => {
-                                                warn!("TCP REALITY Server TLS Accept failed: {}", e);
+                                            Ok(Err(e)) => {
+                                                warn!(
+                                                    "TCP REALITY Server TLS Accept failed: {}",
+                                                    e
+                                                );
+                                            }
+                                            Err(_) => {
+                                                warn!(
+                                                    "TCP REALITY Server TLS Accept timed out after {}s",
+                                                    session_policy_inner.handshake_timeout.as_secs()
+                                                );
                                             }
                                         }
-                                    } else if let Ok(mut fallback_addrs) = tokio::net::lookup_host(&dest).await {
+                                    } else if let Ok(mut fallback_addrs) =
+                                        tokio::net::lookup_host(&dest).await
+                                    {
+                                        server_metrics_inner.inc_reality_fallback();
                                         if let Some(target_addr) = fallback_addrs.next() {
-                                            match tokio::net::TcpStream::connect(target_addr).await {
-                                                Ok(target_stream) => {
-                                                    if let Err(e) = relay_until_either_side_finishes(wrapped_stream, target_stream, idle_policy_inner.timeout).await {
-                                                        log_relay_error("TCP Fallback relay error", Some(client_addr), &e);
+                                            match tokio::time::timeout(
+                                                session_policy_inner.handshake_timeout,
+                                                tokio::net::TcpStream::connect(target_addr),
+                                            )
+                                            .await
+                                            {
+                                                Ok(Ok(target_stream)) => {
+                                                    if let Err(e) =
+                                                        relay_until_either_side_finishes(
+                                                            wrapped_stream,
+                                                            target_stream,
+                                                            session_policy_inner
+                                                                .connection_idle_timeout,
+                                                            session_policy_inner.half_close_timeout,
+                                                        )
+                                                        .await
+                                                    {
+                                                        log_relay_error(
+                                                            "TCP Fallback relay error",
+                                                            Some(client_addr),
+                                                            &e,
+                                                        );
                                                     }
                                                 }
-                                                Err(e) => {
+                                                Ok(Err(e)) => {
                                                     warn!("TCP Fallback: Failed to connect to {} for client {}: {}", target_addr, client_addr, e);
+                                                }
+                                                Err(_) => {
+                                                    warn!(
+                                                        "TCP Fallback: connect to {} for client {} timed out after {}s",
+                                                        target_addr,
+                                                        client_addr,
+                                                        session_policy_inner.handshake_timeout.as_secs()
+                                                    );
                                                 }
                                             }
                                         }
@@ -379,20 +599,39 @@ pub async fn run_server(config_path: &str) -> Result<()> {
                 }
             }
         });
-        
+
         endpoint
     } else {
         Endpoint::server(server_config, config.listen)?
     };
 
+    let quic_connection_limiter = Arc::new(Semaphore::new(max_quic_connections));
+
     while let Some(incoming) = endpoint.accept().await {
+        let permit = match quic_connection_limiter.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => break,
+        };
         let config = config.clone();
         let idle_policy = idle_policy.clone();
+        let session_policy = session_policy.clone();
+        let metrics = metrics.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             match incoming.await {
                 Ok(conn) => {
                     info!("New connection from {}", conn.remote_address());
-                    if let Err(e) = handle_connection(conn, config, idle_policy).await {
+                    if let Err(e) = handle_connection(
+                        conn,
+                        config,
+                        idle_policy,
+                        session_policy,
+                        max_udp_associations_per_connection,
+                        max_bi_stream_tasks_per_connection,
+                        metrics,
+                    )
+                    .await
+                    {
                         error!("Connection error: {}", e);
                     }
                 }
@@ -415,14 +654,22 @@ async fn handle_connection(
     conn: quinn::Connection,
     config: ServerConfig,
     idle_policy: Arc<IdleSessionPolicy>,
+    session_policy: Arc<SessionGovernancePolicy>,
+    max_udp_associations_per_connection: usize,
+    max_bi_stream_tasks_per_connection: usize,
+    metrics: Arc<ServerMetrics>,
 ) -> Result<()> {
-    let seacore_conn = Connection::<side::Server>::new(seacore_protocol::quic::InnerConn::Quic(conn.clone()));
+    let seacore_conn =
+        Connection::<side::Server>::new(seacore_protocol::quic::InnerConn::Quic(conn.clone()));
     let conn_for_streams = conn.clone();
 
-    // 1. Wait up to 5 seconds for Authenticate command on a uni-stream
-    let auth_success = match tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    // 1. Wait for Authenticate command on a uni-stream
+    let auth_success = match tokio::time::timeout(session_policy.handshake_timeout, async {
         if let Ok(recv) = conn_for_streams.accept_uni().await {
-            if let Ok(Task::Authenticate(auth)) = seacore_conn.accept_uni_stream(seacore_protocol::quic::SeaCoreReadStream::Quic(recv)).await {
+            if let Ok(Task::Authenticate(auth)) = seacore_conn
+                .accept_uni_stream(seacore_protocol::quic::SeaCoreReadStream::Quic(recv))
+                .await
+            {
                 let uuid = auth.uuid;
                 if let Some(user) = config.users.iter().find(|u| u.uuid == uuid) {
                     if auth.validate(&user.password) {
@@ -436,25 +683,35 @@ async fn handle_connection(
             }
         }
         false
-    }).await {
+    })
+    .await
+    {
         Ok(res) => res,
         Err(_) => false,
     };
+    metrics.record_auth_attempt(auth_success);
 
     if !auth_success {
-        warn!("Unauthenticated QUIC connection from {}. (Note: should have been caught by UDP Router!)", conn.remote_address());
-        conn.close(quinn::VarInt::from_u32(0x01), b"unauthorized");
+        debug!(
+            "Unauthenticated QUIC connection from {}, closing silently",
+            conn.remote_address()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        conn.close(quinn::VarInt::from_u32(0x00), b"");
         return Ok(());
     }
 
+    let _active_connection = metrics.track_active_connection();
     info!("User authenticated from {}", conn.remote_address());
-    
+
     let udp_assocs: Arc<Mutex<HashMap<u16, UdpAssoc>>> = Arc::new(Mutex::new(HashMap::new()));
     let udp_assoc_touches: Arc<Mutex<HashMap<u16, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
+    let bi_stream_limiter = Arc::new(Semaphore::new(max_bi_stream_tasks_per_connection));
 
     let udp_assocs_cleanup = udp_assocs.clone();
     let udp_assoc_touches_cleanup = udp_assoc_touches.clone();
     let idle_policy_cleanup = idle_policy.clone();
+    let metrics_janitor = metrics.clone();
     let udp_janitor = tokio::spawn(async move {
         loop {
             tokio::time::sleep(idle_policy_cleanup.check_interval).await;
@@ -478,6 +735,8 @@ async fn handle_connection(
                 if now.saturating_duration_since(last_active) >= idle_policy_cleanup.timeout {
                     if let Some(assoc) = assocs.remove(&assoc_id) {
                         assoc.task.abort();
+                        metrics_janitor.inc_udp_assoc_closed(1);
+                        metrics_janitor.dec_udp_assoc_active(1);
                     }
                     touches.remove(&assoc_id);
                 }
@@ -489,6 +748,7 @@ async fn handle_connection(
     let seacore_conn_dg = seacore_conn.clone();
     let udp_assocs_dg = udp_assocs.clone();
     let udp_assoc_touches_dg = udp_assoc_touches.clone();
+    let metrics_dg = metrics.clone();
     tokio::spawn(async move {
         loop {
             match conn.read_datagram().await {
@@ -511,7 +771,11 @@ async fn handle_connection(
                                 udp_assocs_dg.clone(),
                                 udp_assoc_touches_dg.clone(),
                                 seacore_conn_dg.clone(),
-                            ).await {
+                                max_udp_associations_per_connection,
+                                metrics_dg.clone(),
+                            )
+                            .await
+                            {
                                 warn!("UDP packet handling error: {}", e);
                             }
                         }
@@ -548,6 +812,8 @@ async fn handle_connection(
                                 let mut assocs = udp_assocs.lock().await;
                                 if let Some(assoc) = assocs.remove(&assoc_id) {
                                     assoc.task.abort();
+                                    metrics.inc_udp_assoc_closed(1);
+                                    metrics.dec_udp_assoc_active(1);
                                 }
                                 udp_assoc_touches.lock().await.remove(&assoc_id);
                             }
@@ -561,6 +827,8 @@ async fn handle_connection(
                                     udp_assocs.clone(),
                                     udp_assoc_touches.clone(),
                                     seacore_conn.clone(),
+                                    max_udp_associations_per_connection,
+                                    metrics.clone(),
                                 ).await {
                                     warn!("UDP packet handling error: {}", e);
                                 }
@@ -581,9 +849,20 @@ async fn handle_connection(
             bi = conn_for_streams.accept_bi() => {
                 match bi {
                     Ok((send, recv)) => {
+                        let permit = match bi_stream_limiter.clone().try_acquire_owned() {
+                            Ok(permit) => permit,
+                            Err(_) => {
+                                warn!(
+                                    "Dropping bi-stream because max_bi_stream_tasks_per_connection={} was reached",
+                                    max_bi_stream_tasks_per_connection
+                                );
+                                continue;
+                            }
+                        };
                         let seacore_conn = seacore_conn.clone();
-                        let idle_policy = idle_policy.clone();
+                        let session_policy = session_policy.clone();
                         tokio::spawn(async move {
+                            let _permit = permit;
                             match seacore_conn.accept_bi_stream(
                                 seacore_protocol::quic::SeaCoreWriteStream::Quic(send),
                                 seacore_protocol::quic::SeaCoreReadStream::Quic(recv)
@@ -600,7 +879,12 @@ async fn handle_connection(
                                     };
                                     match tokio::net::TcpStream::connect(&target_addr_str).await {
                                         Ok(target) => {
-                                            if let Err(e) = relay_until_either_side_finishes(stream, target, idle_policy.timeout).await {
+                                            if let Err(e) = relay_until_either_side_finishes(
+                                                stream,
+                                                target,
+                                                session_policy.connection_idle_timeout,
+                                                session_policy.half_close_timeout,
+                                            ).await {
                                                 log_relay_error("TCP relay error", None, &e);
                                             }
                                         }
@@ -624,6 +908,20 @@ async fn handle_connection(
     }
 
     udp_janitor.abort();
+
+    let remaining = {
+        let mut assocs = udp_assocs.lock().await;
+        let remaining = assocs.len() as u64;
+        for (_, assoc) in assocs.drain() {
+            assoc.task.abort();
+        }
+        remaining
+    };
+    if remaining > 0 {
+        metrics.inc_udp_assoc_closed(remaining);
+        metrics.dec_udp_assoc_active(remaining as i64);
+    }
+
     Ok(())
 }
 
@@ -631,6 +929,7 @@ async fn relay_until_either_side_finishes<L, R>(
     left: L,
     right: R,
     relay_idle_timeout: Duration,
+    half_close_timeout: Duration,
 ) -> std::io::Result<()>
 where
     L: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -642,27 +941,56 @@ where
     let mut right_buf = vec![0u8; 8192];
 
     let relay_result = async {
+        let mut left_closed = false;
+        let mut right_closed = false;
+        let mut half_close_deadline: Option<Instant> = None;
+
         loop {
+            if left_closed && right_closed {
+                return Ok(());
+            }
+
+            let wait_budget = match half_close_deadline {
+                Some(deadline) => {
+                    let remain = deadline.saturating_duration_since(Instant::now());
+                    if remain.is_zero() {
+                        return Ok(());
+                    }
+                    remain.min(relay_idle_timeout)
+                }
+                None => relay_idle_timeout,
+            };
+
             tokio::select! {
-                left_read_result = tokio::time::timeout(relay_idle_timeout, left_read.read(&mut left_buf)) => {
+                left_read_result = tokio::time::timeout(wait_budget, left_read.read(&mut left_buf)), if !left_closed => {
                     let n = match left_read_result {
                         Ok(Ok(n)) => n,
                         Ok(Err(e)) => return Err(e),
-                        Err(_) => return Ok(()), // Idle timeout.
+                        Err(_) => return Ok(()),
                     };
                     if n == 0 {
-                        return Ok(());
+                        left_closed = true;
+                        if half_close_deadline.is_none() {
+                            half_close_deadline = Some(Instant::now() + half_close_timeout);
+                        }
+                        let _ = tokio::time::timeout(Duration::from_millis(200), right_write.shutdown()).await;
+                        continue;
                     }
                     right_write.write_all(&left_buf[..n]).await?;
                 }
-                right_read_result = tokio::time::timeout(relay_idle_timeout, right_read.read(&mut right_buf)) => {
+                right_read_result = tokio::time::timeout(wait_budget, right_read.read(&mut right_buf)), if !right_closed => {
                     let n = match right_read_result {
                         Ok(Ok(n)) => n,
                         Ok(Err(e)) => return Err(e),
-                        Err(_) => return Ok(()), // Idle timeout.
+                        Err(_) => return Ok(()),
                     };
                     if n == 0 {
-                        return Ok(());
+                        right_closed = true;
+                        if half_close_deadline.is_none() {
+                            half_close_deadline = Some(Instant::now() + half_close_timeout);
+                        }
+                        let _ = tokio::time::timeout(Duration::from_millis(200), left_write.shutdown()).await;
+                        continue;
                     }
                     left_write.write_all(&right_buf[..n]).await?;
                 }
@@ -673,11 +1001,8 @@ where
     // On reset/abort paths (e.g. 10054), graceful TLS shutdown can become expensive.
     // Only try a bounded graceful close on normal EOF; otherwise drop halves directly.
     if relay_result.is_ok() {
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            left_write.shutdown(),
-        )
-        .await;
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(200), left_write.shutdown())
+            .await;
         let _ = tokio::time::timeout(
             std::time::Duration::from_millis(200),
             right_write.shutdown(),
@@ -721,10 +1046,15 @@ async fn handle_server_udp_packet(
     udp_assocs: Arc<Mutex<HashMap<u16, UdpAssoc>>>,
     udp_assoc_touches: Arc<Mutex<HashMap<u16, Instant>>>,
     seacore_conn: Connection<side::Server>,
+    max_udp_associations: usize,
+    metrics: Arc<ServerMetrics>,
 ) -> Result<()> {
     let payload: bytes::Bytes = pkt.payload().await?;
-    udp_assoc_touches.lock().await.insert(assoc_id, Instant::now());
-    
+    udp_assoc_touches
+        .lock()
+        .await
+        .insert(assoc_id, Instant::now());
+
     let target_addr_str = match &addr {
         Address::SocketAddress(sa) => sa.to_string(),
         Address::DomainAddress(domain, port) => format!("{}:{}", domain, port),
@@ -738,21 +1068,34 @@ async fn handle_server_udp_packet(
         if let Some(assoc) = assocs.get(&assoc_id) {
             assoc.socket.clone()
         } else {
+            if assocs.len() >= max_udp_associations {
+                return Err(eyre::eyre!(
+                    "udp association limit reached ({})",
+                    max_udp_associations
+                ));
+            }
+
             // Determine if we should bind IPv4 or IPv6 based on the target config? 0.0.0.0 is usually fine
             let socket = Arc::new(tokio::net::UdpSocket::bind("0.0.0.0:0").await?);
             let socket_clone = socket.clone();
             let udp_assoc_touches_clone = udp_assoc_touches.clone();
-            
+
             let task = tokio::spawn(async move {
                 let mut buf = vec![0u8; 65536];
                 loop {
                     match socket_clone.recv_from(&mut buf).await {
                         Ok((size, peer_addr)) => {
-                            udp_assoc_touches_clone.lock().await.insert(assoc_id, Instant::now());
+                            udp_assoc_touches_clone
+                                .lock()
+                                .await
+                                .insert(assoc_id, Instant::now());
                             let data = &buf[..size];
                             let seacore_addr = Address::SocketAddress(peer_addr);
                             // We use packet_quic as a default reliable relay back, or datagram for speed
-                            if let Err(e) = seacore_conn.packet_native(data, seacore_addr, assoc_id).await {
+                            if let Err(e) = seacore_conn
+                                .packet_native(data, seacore_addr, assoc_id)
+                                .await
+                            {
                                 warn!("Failed to send UDP reply back to client: {}", e);
                             }
                         }
@@ -763,12 +1106,20 @@ async fn handle_server_udp_packet(
                     }
                 }
             });
-            
-            assocs.insert(assoc_id, UdpAssoc {
-                socket: socket.clone(),
-                task,
-            });
-            udp_assoc_touches.lock().await.insert(assoc_id, Instant::now());
+
+            assocs.insert(
+                assoc_id,
+                UdpAssoc {
+                    socket: socket.clone(),
+                    task,
+                },
+            );
+            metrics.inc_udp_assoc_created();
+            metrics.inc_udp_assoc_active();
+            udp_assoc_touches
+                .lock()
+                .await
+                .insert(assoc_id, Instant::now());
             socket
         }
     };
@@ -783,11 +1134,14 @@ async fn handle_tcp_connection(
     mut recv: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
     config: ServerConfig,
     idle_policy: Arc<IdleSessionPolicy>,
+    session_policy: Arc<SessionGovernancePolicy>,
+    max_udp_associations_per_connection: usize,
+    metrics: Arc<ServerMetrics>,
 ) -> Result<()> {
     info!("Starting SeaCore TCP Connection Handler");
-    
+
     // Auth timeout loop
-    let auth_success = match tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let auth_success = match tokio::time::timeout(session_policy.handshake_timeout, async {
         if let Ok(Task::Authenticate(auth)) = seacore_conn.next_tcp_task(recv.as_mut()).await {
             let uuid = auth.uuid;
             if let Some(user) = config.users.iter().find(|u| u.uuid == uuid) {
@@ -801,25 +1155,31 @@ async fn handle_tcp_connection(
             }
         }
         false
-    }).await {
+    })
+    .await
+    {
         Ok(res) => res,
         Err(_) => false,
     };
+    metrics.record_auth_attempt(auth_success);
 
     if !auth_success {
         warn!("TCP connection authentication failed. Closing.");
         return Ok(());
     }
 
+    let _active_connection = metrics.track_active_connection();
     info!("User authenticated via TCP");
 
-    let udp_assocs: Arc<tokio::sync::Mutex<HashMap<u16, UdpAssoc>>> = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let udp_assocs: Arc<tokio::sync::Mutex<HashMap<u16, UdpAssoc>>> =
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let udp_assoc_touches: Arc<tokio::sync::Mutex<HashMap<u16, Instant>>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
     let udp_assocs_cleanup = udp_assocs.clone();
     let udp_assoc_touches_cleanup = udp_assoc_touches.clone();
     let idle_policy_cleanup = idle_policy.clone();
+    let metrics_janitor = metrics.clone();
     let udp_janitor = tokio::spawn(async move {
         loop {
             tokio::time::sleep(idle_policy_cleanup.check_interval).await;
@@ -843,13 +1203,15 @@ async fn handle_tcp_connection(
                 if now.saturating_duration_since(last_active) >= idle_policy_cleanup.timeout {
                     if let Some(assoc) = assocs.remove(&assoc_id) {
                         assoc.task.abort();
+                        metrics_janitor.inc_udp_assoc_closed(1);
+                        metrics_janitor.dec_udp_assoc_active(1);
                     }
                     touches.remove(&assoc_id);
                 }
             }
         }
     });
-    
+
     // Process remaining packets sequentially
     loop {
         match seacore_conn.next_tcp_task(recv.as_mut()).await {
@@ -863,12 +1225,19 @@ async fn handle_tcp_connection(
                     udp_assocs.clone(),
                     udp_assoc_touches.clone(),
                     seacore_conn.clone(),
-                ).await {
+                    max_udp_associations_per_connection,
+                    metrics.clone(),
+                )
+                .await
+                {
                     warn!("TCP UDP packet handling error: {}", e);
                 }
             }
             Ok(Task::Connect(_bistream, addr)) => {
-                info!("TCP CONNECT request over authenticated Reality connection to {}", addr);
+                info!(
+                    "TCP CONNECT request over authenticated Reality connection to {}",
+                    addr
+                );
                 let target_addr_str = match &addr {
                     Address::SocketAddress(sa) => sa.to_string(),
                     Address::DomainAddress(domain, port) => format!("{}:{}", domain, port),
@@ -882,42 +1251,79 @@ async fn handle_tcp_connection(
                         let relay_result = async {
                             let mut up_buf = vec![0u8; 8192];
                             let mut down_buf = vec![0u8; 8192];
+                            let mut client_closed = false;
+                            let mut target_closed = false;
+                            let mut half_close_deadline: Option<Instant> = None;
 
                             // Hold the writer lock for the whole relay.
                             // Locking per chunk adds avoidable overhead under sustained traffic.
-                            let mut client_writer = if let seacore_protocol::quic::InnerConn::Tcp(t) = &writer_conn {
-                                Some(t.lock().await)
-                            } else {
-                                None
-                            };
+                            let mut client_writer =
+                                if let seacore_protocol::quic::InnerConn::Tcp(t) = &writer_conn {
+                                    Some(t.lock().await)
+                                } else {
+                                    None
+                                };
 
                             loop {
+                                if client_closed && target_closed {
+                                    return Ok(());
+                                }
+
+                                let wait_budget = match half_close_deadline {
+                                    Some(deadline) => {
+                                        let remain = deadline.saturating_duration_since(Instant::now());
+                                        if remain.is_zero() {
+                                            return Ok(());
+                                        }
+                                        remain.min(session_policy.connection_idle_timeout)
+                                    }
+                                    None => session_policy.connection_idle_timeout,
+                                };
+
                                 tokio::select! {
                                     read_from_client = tokio::time::timeout(
-                                        idle_policy.timeout,
+                                        wait_budget,
                                         recv.read(&mut up_buf)
-                                    ) => {
+                                    ), if !client_closed => {
                                         let n = match read_from_client {
                                             Ok(Ok(n)) => n,
                                             Ok(Err(e)) => return Err(e),
-                                            Err(_) => return Ok(()), // Idle timeout: close both sides.
+                                            Err(_) => return Ok(()),
                                         };
                                         if n == 0 {
-                                            return Ok(());
+                                            client_closed = true;
+                                            if half_close_deadline.is_none() {
+                                                half_close_deadline = Some(Instant::now() + session_policy.half_close_timeout);
+                                            }
+                                            let _ = tokio::time::timeout(
+                                                Duration::from_millis(200),
+                                                target_wi.shutdown(),
+                                            ).await;
+                                            continue;
                                         }
                                         target_wi.write_all(&up_buf[..n]).await?;
                                     }
                                     read_from_target = tokio::time::timeout(
-                                        idle_policy.timeout,
+                                        wait_budget,
                                         target_ri.read(&mut down_buf)
-                                    ) => {
+                                    ), if !target_closed => {
                                         let n = match read_from_target {
                                             Ok(Ok(n)) => n,
                                             Ok(Err(e)) => return Err(e),
-                                            Err(_) => return Ok(()), // Idle timeout: close both sides.
+                                            Err(_) => return Ok(()),
                                         };
                                         if n == 0 {
-                                            return Ok(());
+                                            target_closed = true;
+                                            if half_close_deadline.is_none() {
+                                                half_close_deadline = Some(Instant::now() + session_policy.half_close_timeout);
+                                            }
+                                            if let Some(w) = client_writer.as_mut() {
+                                                let _ = tokio::time::timeout(
+                                                    Duration::from_millis(200),
+                                                    w.shutdown(),
+                                                ).await;
+                                            }
+                                            continue;
                                         }
                                         if let Some(w) = client_writer.as_mut() {
                                             w.write_all(&down_buf[..n]).await?;
@@ -925,18 +1331,46 @@ async fn handle_tcp_connection(
                                     }
                                 }
                             }
-                        }.await;
+                        }
+                        .await;
 
                         if let Err(e) = relay_result {
                             log_relay_error("TCP CONNECT relay error", None, &e);
                         }
 
                         udp_janitor.abort();
+                        let remaining = {
+                            let mut assocs = udp_assocs.lock().await;
+                            let remaining = assocs.len() as u64;
+                            for (_, assoc) in assocs.drain() {
+                                assoc.task.abort();
+                            }
+                            remaining
+                        };
+                        if remaining > 0 {
+                            metrics.inc_udp_assoc_closed(remaining);
+                            metrics.dec_udp_assoc_active(remaining as i64);
+                        }
                         return Ok(());
                     }
                     Err(e) => {
-                        warn!("TCP CONNECT: Failed to connect to {}: {}", target_addr_str, e);
+                        warn!(
+                            "TCP CONNECT: Failed to connect to {}: {}",
+                            target_addr_str, e
+                        );
                         udp_janitor.abort();
+                        let remaining = {
+                            let mut assocs = udp_assocs.lock().await;
+                            let remaining = assocs.len() as u64;
+                            for (_, assoc) in assocs.drain() {
+                                assoc.task.abort();
+                            }
+                            remaining
+                        };
+                        if remaining > 0 {
+                            metrics.inc_udp_assoc_closed(remaining);
+                            metrics.dec_udp_assoc_active(remaining as i64);
+                        }
                         return Ok(());
                     }
                 }
@@ -945,6 +1379,8 @@ async fn handle_tcp_connection(
                 let mut assocs = udp_assocs.lock().await;
                 if let Some(assoc) = assocs.remove(&assoc_id) {
                     assoc.task.abort();
+                    metrics.inc_udp_assoc_closed(1);
+                    metrics.dec_udp_assoc_active(1);
                 }
                 udp_assoc_touches.lock().await.remove(&assoc_id);
             }
@@ -959,8 +1395,21 @@ async fn handle_tcp_connection(
             }
         }
     }
-    
+
     udp_janitor.abort();
+
+    let remaining = {
+        let mut assocs = udp_assocs.lock().await;
+        let remaining = assocs.len() as u64;
+        for (_, assoc) in assocs.drain() {
+            assoc.task.abort();
+        }
+        remaining
+    };
+    if remaining > 0 {
+        metrics.inc_udp_assoc_closed(remaining);
+        metrics.dec_udp_assoc_active(remaining as i64);
+    }
+
     Ok(())
 }
-

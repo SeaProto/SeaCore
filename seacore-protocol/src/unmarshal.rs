@@ -2,7 +2,6 @@ use std::io::{self, Cursor, Read};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use tokio::io::AsyncReadExt;
 
-
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -60,10 +59,14 @@ impl Header {
 
         let type_code = buf[1];
         match type_code {
-            0x00 => Ok(Header::Authenticate(Authenticate::async_unmarshal(reader).await?)),
+            0x00 => Ok(Header::Authenticate(
+                Authenticate::async_unmarshal(reader).await?,
+            )),
             0x01 => Ok(Header::Connect(Connect::async_unmarshal(reader).await?)),
             0x02 => Ok(Header::Packet(Packet::async_unmarshal(reader).await?)),
-            0x03 => Ok(Header::Dissociate(Dissociate::async_unmarshal(reader).await?)),
+            0x03 => Ok(Header::Dissociate(
+                Dissociate::async_unmarshal(reader).await?,
+            )),
             0x04 => Ok(Header::Heartbeat(Heartbeat::new())),
             0x05 => Ok(Header::Ping(Ping::async_unmarshal(reader).await?)),
             _ => Err(UnmarshalError::InvalidCommandType(type_code)),
@@ -79,7 +82,11 @@ impl Authenticate {
         read_exact(reader, &mut uuid_buf)?;
         read_exact(reader, &mut time_buf)?;
         read_exact(reader, &mut token_buf)?;
-        Ok(Self::new(Uuid::from_bytes(uuid_buf), u64::from_be_bytes(time_buf), token_buf))
+        Ok(Self::new(
+            Uuid::from_bytes(uuid_buf),
+            u64::from_be_bytes(time_buf),
+            token_buf,
+        ))
     }
 
     async fn async_unmarshal<R: tokio::io::AsyncRead + Unpin + ?Sized>(
@@ -91,7 +98,11 @@ impl Authenticate {
         reader.read_exact(&mut uuid_buf).await?;
         reader.read_exact(&mut time_buf).await?;
         reader.read_exact(&mut token_buf).await?;
-        Ok(Self::new(Uuid::from_bytes(uuid_buf), u64::from_be_bytes(time_buf), token_buf))
+        Ok(Self::new(
+            Uuid::from_bytes(uuid_buf),
+            u64::from_be_bytes(time_buf),
+            token_buf,
+        ))
     }
 }
 
@@ -158,7 +169,9 @@ impl Ping {
         let mut buf = [0u8; 10];
         read_exact(reader, &mut buf)?;
         let seq_id = u16::from_be_bytes([buf[0], buf[1]]);
-        let timestamp = u64::from_be_bytes([buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9]]);
+        let timestamp = u64::from_be_bytes([
+            buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9],
+        ]);
         Ok(Self::new(seq_id, timestamp))
     }
 
@@ -168,7 +181,9 @@ impl Ping {
         let mut buf = [0u8; 10];
         reader.read_exact(&mut buf).await?;
         let seq_id = u16::from_be_bytes([buf[0], buf[1]]);
-        let timestamp = u64::from_be_bytes([buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9]]);
+        let timestamp = u64::from_be_bytes([
+            buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9],
+        ]);
         Ok(Self::new(seq_id, timestamp))
     }
 }
@@ -197,10 +212,8 @@ impl Address {
                 let mut port_buf = [0u8; 2];
                 read_exact(reader, &mut addr_buf)?;
                 read_exact(reader, &mut port_buf)?;
-                let addr = SocketAddrV4::new(
-                    Ipv4Addr::from(addr_buf),
-                    u16::from_be_bytes(port_buf),
-                );
+                let addr =
+                    SocketAddrV4::new(Ipv4Addr::from(addr_buf), u16::from_be_bytes(port_buf));
                 Ok(Self::SocketAddress(SocketAddr::V4(addr)))
             }
             Self::TYPE_CODE_IPV6 => {
@@ -208,12 +221,8 @@ impl Address {
                 let mut port_buf = [0u8; 2];
                 read_exact(reader, &mut addr_buf)?;
                 read_exact(reader, &mut port_buf)?;
-                let addr = SocketAddrV6::new(
-                    Ipv6Addr::from(addr_buf),
-                    u16::from_be_bytes(port_buf),
-                    0,
-                    0,
-                );
+                let addr =
+                    SocketAddrV6::new(Ipv6Addr::from(addr_buf), u16::from_be_bytes(port_buf), 0, 0);
                 Ok(Self::SocketAddress(SocketAddr::V6(addr)))
             }
             t => Err(UnmarshalError::InvalidAddressType(t)),
@@ -245,10 +254,8 @@ impl Address {
                 let mut port_buf = [0u8; 2];
                 reader.read_exact(&mut addr_buf).await?;
                 reader.read_exact(&mut port_buf).await?;
-                let addr = SocketAddrV4::new(
-                    Ipv4Addr::from(addr_buf),
-                    u16::from_be_bytes(port_buf),
-                );
+                let addr =
+                    SocketAddrV4::new(Ipv4Addr::from(addr_buf), u16::from_be_bytes(port_buf));
                 Ok(Self::SocketAddress(SocketAddr::V4(addr)))
             }
             Self::TYPE_CODE_IPV6 => {
@@ -256,12 +263,8 @@ impl Address {
                 let mut port_buf = [0u8; 2];
                 reader.read_exact(&mut addr_buf).await?;
                 reader.read_exact(&mut port_buf).await?;
-                let addr = SocketAddrV6::new(
-                    Ipv6Addr::from(addr_buf),
-                    u16::from_be_bytes(port_buf),
-                    0,
-                    0,
-                );
+                let addr =
+                    SocketAddrV6::new(Ipv6Addr::from(addr_buf), u16::from_be_bytes(port_buf), 0, 0);
                 Ok(Self::SocketAddress(SocketAddr::V6(addr)))
             }
             t => Err(UnmarshalError::InvalidAddressType(t)),

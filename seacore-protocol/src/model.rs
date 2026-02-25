@@ -10,12 +10,8 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::protocol::{
-    Address,
-    Authenticate as AuthenticateHeader,
-    Connect as ConnectHeader,
-    Dissociate as DissociateHeader,
-    Heartbeat as HeartbeatHeader,
-    Packet as PacketHeader,
+    Address, Authenticate as AuthenticateHeader, Connect as ConnectHeader,
+    Dissociate as DissociateHeader, Heartbeat as HeartbeatHeader, Packet as PacketHeader,
     Ping as PingHeader,
 };
 
@@ -59,7 +55,7 @@ where
         password: impl AsRef<[u8]>,
         exporter: Option<&impl KeyingMaterialExporter>,
     ) -> AuthenticateHeader {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let timestamp = SystemTime::now()
@@ -97,7 +93,7 @@ where
         password: impl AsRef<[u8]>,
         exporter: Option<&impl KeyingMaterialExporter>,
     ) -> bool {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let now = SystemTime::now()
@@ -147,12 +143,19 @@ where
     // ── Packet ────────────────────────────────────
 
     pub fn send_packet(&self, assoc_id: u16, addr: Address, max_pkt_size: usize) -> PacketSender {
-        self.udp_sessions.lock().send_packet(assoc_id, addr, max_pkt_size, &self.task_associate_count)
+        self.udp_sessions.lock().send_packet(
+            assoc_id,
+            addr,
+            max_pkt_size,
+            &self.task_associate_count,
+        )
     }
 
     pub fn recv_packet(&self, header: PacketHeader) -> PacketHeader {
         let assoc_id = header.assoc_id();
-        self.udp_sessions.lock().ensure_session(assoc_id, &self.task_associate_count);
+        self.udp_sessions
+            .lock()
+            .ensure_session(assoc_id, &self.task_associate_count);
         header
     }
 
@@ -205,7 +208,10 @@ pub struct PacketSender {
 
 impl PacketSender {
     /// Split a payload into fragments and return (header, fragment_data) pairs
-    pub fn into_fragments<'a>(&self, payload: &'a [u8]) -> Vec<(crate::protocol::Header, &'a [u8])> {
+    pub fn into_fragments<'a>(
+        &self,
+        payload: &'a [u8],
+    ) -> Vec<(crate::protocol::Header, &'a [u8])> {
         use crate::protocol::Header;
 
         if payload.is_empty() {
@@ -293,7 +299,9 @@ where
 
     fn collect_garbage(&mut self, timeout: Duration) {
         for (_, session) in self.sessions.iter_mut() {
-            session.pkt_buf.retain(|_, buf| buf.c_time.elapsed() < timeout);
+            session
+                .pkt_buf
+                .retain(|_, buf| buf.c_time.elapsed() < timeout);
         }
     }
 }
@@ -353,11 +361,15 @@ where
         }
 
         if frag_id == 0 && addr.is_none() {
-            return Err(AssembleError::InvalidAddress("no address in first fragment"));
+            return Err(AssembleError::InvalidAddress(
+                "no address in first fragment",
+            ));
         }
 
         if frag_id != 0 && !addr.is_none() {
-            return Err(AssembleError::InvalidAddress("address in non-first fragment"));
+            return Err(AssembleError::InvalidAddress(
+                "address in non-first fragment",
+            ));
         }
 
         if self.buf[frag_id as usize].is_some() {

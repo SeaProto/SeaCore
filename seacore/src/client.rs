@@ -1,12 +1,14 @@
+use std::cmp::Reverse;
+use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
-use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::collections::HashMap;
-use std::cmp::Reverse;
+use std::sync::Mutex as StdMutex;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
 use tokio::sync::mpsc;
+use tokio::sync::Mutex;
+use tokio::sync::Semaphore;
 
 use eyre::Result;
 use quinn::Endpoint;
@@ -18,16 +20,20 @@ use uuid::Uuid;
 
 use seacore_protocol::protocol::Address;
 use seacore_protocol::quic::{side, Connection, Task};
+use seacore_protocol::reality::{parse_short_id_hex, BrowserProfile};
 
-use rustls::crypto::{ActiveKeyExchange, SharedSecret, SupportedKxGroup};
-use rustls::NamedGroup;
-use x25519_dalek::{StaticSecret, PublicKey};
+use crate::metrics::ClientMetrics;
+use crate::session_policy::SessionGovernancePolicy;
+
 use rand::rngs::OsRng;
 use rand::Rng;
+use rustls::crypto::{ActiveKeyExchange, SharedSecret, SupportedKxGroup};
+use rustls::NamedGroup;
+use x25519_dalek::{PublicKey, StaticSecret};
 
-use rustls::internal::msgs::handshake::{ClientExtension, UnknownExtension};
-use rustls::internal::msgs::enums::ExtensionType;
 use rustls::internal::msgs::base::Payload;
+use rustls::internal::msgs::enums::ExtensionType;
+use rustls::internal::msgs::handshake::{ClientExtension, UnknownExtension};
 
 fn get_grease_u16() -> u16 {
     let mut rng = rand::thread_rng();
@@ -46,12 +52,20 @@ pub struct ClientConfig {
     pub transport: Option<String>,
     pub congestion_control: Option<String>,
     pub max_idle_time_secs: Option<u64>,
+    pub connection_idle_timeout_secs: Option<u64>,
+    pub handshake_timeout_secs: Option<u64>,
+    pub half_close_timeout_secs: Option<u64>,
     #[allow(dead_code)]
     pub max_udp_relay_packet_size: Option<usize>,
     pub idle_session_check_interval_secs: Option<u64>,
     pub idle_session_timeout_secs: Option<u64>,
     pub min_idle_sessions: Option<usize>,
     pub insecure_skip_verify: Option<bool>,
+    pub server_cert_sha256: Option<String>,
+    pub max_inbound_connections: Option<usize>,
+    pub max_uni_stream_tasks: Option<usize>,
+    pub max_udp_associations: Option<usize>,
+    pub metrics_listen: Option<SocketAddr>,
     pub reality: Option<RealitySettings>,
 }
 
@@ -92,51 +106,124 @@ fn idle_session_policy_from_client_config(config: &ClientConfig) -> IdleSessionP
 }
 
 static NEXT_ASSOC_ID: AtomicU16 = AtomicU16::new(1);
-static REALITY_CLIENT_SECRET: OnceLock<StaticSecret> = OnceLock::new();
+static REALITY_CLIENT_SECRET: OnceLock<StdMutex<StaticSecret>> = OnceLock::new();
 static REALITY_KX_GROUP: OnceLock<&'static dyn SupportedKxGroup> = OnceLock::new();
+static REALITY_HANDSHAKE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+const DEFAULT_MAX_INBOUND_CONNECTIONS: usize = 512;
+const DEFAULT_MAX_UNI_STREAM_TASKS: usize = 256;
+const DEFAULT_MAX_UDP_ASSOCIATIONS: usize = 1024;
+
+fn reality_secret_store() -> &'static StdMutex<StaticSecret> {
+    REALITY_CLIENT_SECRET.get_or_init(|| StdMutex::new(StaticSecret::random_from_rng(OsRng)))
+}
+
+fn rotate_reality_client_secret() -> StaticSecret {
+    let mut guard = reality_secret_store()
+        .lock()
+        .expect("reality secret store poisoned");
+    let next = StaticSecret::random_from_rng(OsRng);
+    *guard = next.clone();
+    next
+}
+
+fn current_reality_client_secret() -> StaticSecret {
+    reality_secret_store()
+        .lock()
+        .expect("reality secret store poisoned")
+        .clone()
+}
+
+fn reality_handshake_lock() -> &'static tokio::sync::Mutex<()> {
+    REALITY_HANDSHAKE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
 
 /// Simulate Chrome's HTTP/3 initialization by opening Control, QPACK Encoder,
 /// and QPACK Decoder unidirectional streams with appropriate settings.
+fn encode_quic_varint(value: u64, out: &mut Vec<u8>) {
+    if value <= 63 {
+        out.push(value as u8);
+        return;
+    }
+    if value <= 16_383 {
+        let tagged = (value | 0x4000) as u16;
+        out.extend_from_slice(&tagged.to_be_bytes());
+        return;
+    }
+    if value <= 1_073_741_823 {
+        let tagged = (value | 0x8000_0000) as u32;
+        out.extend_from_slice(&tagged.to_be_bytes());
+        return;
+    }
+    let tagged = value | 0xC000_0000_0000_0000;
+    out.extend_from_slice(&tagged.to_be_bytes());
+}
+
+fn append_h3_setting(payload: &mut Vec<u8>, setting_id: u64, setting_value: u64) {
+    encode_quic_varint(setting_id, payload);
+    encode_quic_varint(setting_value, payload);
+}
+
+fn build_h3_control_stream_payload() -> Vec<u8> {
+    // RFC 9114 control stream:
+    //   stream_type(varint=0x00) + SETTINGS frame
+    // SETTINGS frame:
+    //   frame_type(varint=0x04) + frame_len(varint) + settings_payload
+    let mut settings_payload = Vec::new();
+    append_h3_setting(&mut settings_payload, 0x01, 0); // QPACK_MAX_TABLE_CAPACITY
+    append_h3_setting(&mut settings_payload, 0x06, 262_144); // MAX_FIELD_SECTION_SIZE
+    append_h3_setting(&mut settings_payload, 0x07, 100); // QPACK_BLOCKED_STREAMS
+    append_h3_setting(&mut settings_payload, 0x33, 1); // H3_DATAGRAM
+
+    let mut control = Vec::new();
+    encode_quic_varint(0x00, &mut control); // stream type: control
+    encode_quic_varint(0x04, &mut control); // frame type: SETTINGS
+    encode_quic_varint(settings_payload.len() as u64, &mut control); // frame length
+    control.extend_from_slice(&settings_payload);
+    control
+}
+
+fn build_h3_uni_stream_type(stream_type: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_quic_varint(stream_type, &mut out);
+    out
+}
+
 async fn send_h3_settings(conn: &quinn::Connection) {
     // 1. Control stream (type 0x00) with SETTINGS frame
     if let Ok(mut send) = conn.open_uni().await {
-        let mut buf = Vec::new();
-        // Stream type: Control (0x00)
-        buf.push(0x00);
-        // SETTINGS frame (type=0x04)
-        buf.push(0x04);
-        // Settings payload (variable-length encoded)
-        let mut settings_payload = Vec::new();
-        // QPACK_MAX_TABLE_CAPACITY (0x01) = 0
-        settings_payload.push(0x01);
-        settings_payload.push(0x00);
-        // MAX_FIELD_SECTION_SIZE (0x06) = 262144 (varint: 0x80040000)
-        settings_payload.push(0x06);
-        settings_payload.extend_from_slice(&[0x80, 0x04, 0x00, 0x00]);
-        // H3_DATAGRAM (0x33) = 1
-        settings_payload.push(0x33);
-        settings_payload.push(0x01);
-        // Settings frame length
-        buf.push(settings_payload.len() as u8);
-        buf.extend_from_slice(&settings_payload);
-        let _ = send.write_all(&buf).await;
+        let _ = send.write_all(&build_h3_control_stream_payload()).await;
         // Don't finish — Chrome keeps control stream open
     }
 
     // 2. QPACK Encoder stream (type 0x02)
     if let Ok(mut send) = conn.open_uni().await {
-        let _ = send.write_all(&[0x02]).await;
+        let _ = send.write_all(&build_h3_uni_stream_type(0x02)).await;
         // Chrome keeps this open with no data
     }
 
     // 3. QPACK Decoder stream (type 0x03)
     if let Ok(mut send) = conn.open_uni().await {
-        let _ = send.write_all(&[0x03]).await;
+        let _ = send.write_all(&build_h3_uni_stream_type(0x03)).await;
         // Chrome keeps this open with no data
     }
 }
 
+fn browser_profile_from_config(config: &ClientConfig) -> BrowserProfile {
+    match config
+        .reality
+        .as_ref()
+        .map(|r| r.profile.to_lowercase())
+        .as_deref()
+    {
+        Some("firefox") => BrowserProfile::Firefox,
+        Some("safari") => BrowserProfile::Safari,
+        _ => BrowserProfile::Chrome,
+    }
+}
+
 fn build_tls_config(config: &ClientConfig) -> Result<rustls::ClientConfig> {
+    let profile = browser_profile_from_config(config);
     let mut provider = rustls::crypto::ring::default_provider();
     let mut custom_session_id_opt = None;
     let mut extra_exts = Vec::new();
@@ -166,7 +253,7 @@ fn build_tls_config(config: &ClientConfig) -> Result<rustls::ClientConfig> {
     }));
 
     if let Some(reality) = &config.reality {
-        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
 
         let server_pub_b64 = reality.public_key.as_deref().unwrap_or("");
         let Ok(server_pub_bytes) = STANDARD.decode(server_pub_b64) else {
@@ -179,12 +266,11 @@ fn build_tls_config(config: &ClientConfig) -> Result<rustls::ClientConfig> {
         server_pub_arr.copy_from_slice(&server_pub_bytes);
         let server_pub = PublicKey::from(server_pub_arr);
 
-        // Keep one in-process static secret/group to avoid reconnect-time leaks.
-        let client_secret = REALITY_CLIENT_SECRET
-            .get_or_init(|| StaticSecret::random_from_rng(OsRng))
-            .clone();
+        // Rotate client X25519 secret for every handshake build to avoid
+        // long-lived per-process key reuse fingerprints.
+        let client_secret = rotate_reality_client_secret();
         let shared_secret = client_secret.diffie_hellman(&server_pub);
-        
+
         use ring::hmac;
         use std::time::{SystemTime, UNIX_EPOCH};
         let now = SystemTime::now()
@@ -199,7 +285,9 @@ fn build_tls_config(config: &ClientConfig) -> Result<rustls::ClientConfig> {
         msg.extend_from_slice(&now.to_be_bytes());
         msg.extend_from_slice(config.uuid.as_bytes());
         if let Some(short_id) = reality.short_id.as_ref() {
-            msg.extend_from_slice(short_id.as_bytes());
+            let parsed_short_id = parse_short_id_hex(short_id)
+                .map_err(|e| eyre::eyre!("invalid reality.short_id '{}': {}", short_id, e))?;
+            msg.extend_from_slice(&parsed_short_id);
         }
         let tag = hmac::sign(&key, &msg);
         session_id[8..32].copy_from_slice(&tag.as_ref()[..24]);
@@ -207,19 +295,36 @@ fn build_tls_config(config: &ClientConfig) -> Result<rustls::ClientConfig> {
         custom_session_id_opt = Some(session_id.into());
 
         let leaked_group: &'static dyn SupportedKxGroup = *REALITY_KX_GROUP.get_or_init(|| {
-            Box::leak(Box::new(CustomX25519Group {
-                secret: client_secret.clone(),
-            })) as &'static dyn SupportedKxGroup
+            Box::leak(Box::new(CustomX25519Group)) as &'static dyn SupportedKxGroup
         });
         provider.kx_groups.insert(0, leaked_group);
     }
 
     let insecure_skip_verify = config.insecure_skip_verify.unwrap_or(false);
-    let mut client_crypto = if insecure_skip_verify {
+    let cert_pin = config
+        .server_cert_sha256
+        .as_deref()
+        .map(parse_cert_sha256_pin)
+        .transpose()?;
+
+    let mut client_crypto = if insecure_skip_verify || cert_pin.is_some() {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+        let webpki = rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
+            .build()
+            .map_err(|e| eyre::eyre!("failed to build WebPKI verifier: {}", e))?;
+
+        let verifier = SeaCoreServerVerifier {
+            webpki,
+            allow_invalid_cert_chain: insecure_skip_verify,
+            pinned_sha256: cert_pin,
+        };
+
         rustls::ClientConfig::builder_with_provider(Arc::new(provider))
             .with_safe_default_protocol_versions()?
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(SkipVerification))
+            .with_custom_certificate_verifier(Arc::new(verifier))
             .with_no_client_auth()
     } else {
         let mut roots = rustls::RootCertStore::empty();
@@ -230,28 +335,28 @@ fn build_tls_config(config: &ClientConfig) -> Result<rustls::ClientConfig> {
             .with_no_client_auth()
     };
 
-    client_crypto.alpn_protocols = vec![b"h3".to_vec()];
+    client_crypto.alpn_protocols = profile.quic_alpn_protocols();
     client_crypto.extra_exts = extra_exts;
     client_crypto.custom_session_id = custom_session_id_opt;
 
     if let Some(reality) = &config.reality {
-        let profile = match reality.profile.to_lowercase().as_str() {
-            "chrome" => seacore_protocol::reality::BrowserProfile::Chrome,
-            "firefox" => seacore_protocol::reality::BrowserProfile::Firefox,
-            "safari" => seacore_protocol::reality::BrowserProfile::Safari,
-            _ => seacore_protocol::reality::BrowserProfile::Chrome
-        };
+        let short_id = reality
+            .short_id
+            .as_deref()
+            .map(parse_short_id_hex)
+            .transpose()
+            .map_err(|e| eyre::eyre!("invalid reality.short_id: {}", e))?;
 
         let reality_cfg = seacore_protocol::reality::RealityConfig {
             profile,
             server_name: reality.server_name.clone(),
             public_key: None,
-            short_id: None,
+            short_id,
         };
 
         reality_cfg.apply_to_rustls(&mut client_crypto);
     }
-    
+
     Ok(client_crypto)
 }
 
@@ -259,11 +364,37 @@ pub async fn run_client(config_path: &str) -> Result<()> {
     let config_str = fs::read_to_string(config_path)?;
     let config: Arc<ClientConfig> = Arc::new(serde_json::from_str(&config_str)?);
     let idle_policy = Arc::new(idle_session_policy_from_client_config(&config));
+    let session_policy = Arc::new(SessionGovernancePolicy::from_config(
+        config.handshake_timeout_secs,
+        config.connection_idle_timeout_secs,
+        config.max_idle_time_secs,
+        config.half_close_timeout_secs,
+    ));
+    let max_inbound_connections = config
+        .max_inbound_connections
+        .unwrap_or(DEFAULT_MAX_INBOUND_CONNECTIONS)
+        .max(1);
+    let max_uni_stream_tasks = config
+        .max_uni_stream_tasks
+        .unwrap_or(DEFAULT_MAX_UNI_STREAM_TASKS)
+        .max(1);
+    let max_udp_associations = config
+        .max_udp_associations
+        .unwrap_or(DEFAULT_MAX_UDP_ASSOCIATIONS)
+        .max(1);
 
     info!("Server: {}", config.server);
     info!("SOCKS5 listen: {}", config.socks5_listen);
     if config.insecure_skip_verify.unwrap_or(false) {
-        warn!("TLS certificate verification is disabled (insecure_skip_verify=true)");
+        if config.server_cert_sha256.is_some() {
+            warn!(
+                "Certificate chain verification is disabled; relying on server_cert_sha256 pin only"
+            );
+        } else {
+            warn!("TLS certificate verification is disabled (insecure_skip_verify=true)");
+        }
+    } else if config.server_cert_sha256.is_some() {
+        info!("Server certificate pinning is enabled (server_cert_sha256)");
     }
     info!(
         "Idle session policy: check={}s timeout={}s min_idle={}",
@@ -271,6 +402,21 @@ pub async fn run_client(config_path: &str) -> Result<()> {
         idle_policy.timeout.as_secs(),
         idle_policy.min_idle_sessions
     );
+    info!(
+        "Limits: inbound={} uni_tasks={} udp_assoc={}",
+        max_inbound_connections, max_uni_stream_tasks, max_udp_associations
+    );
+    info!(
+        "Session governance: handshake={}s conn_idle={}s half_close={}s",
+        session_policy.handshake_timeout.as_secs(),
+        session_policy.connection_idle_timeout.as_secs(),
+        session_policy.half_close_timeout.as_secs()
+    );
+
+    let metrics = Arc::new(ClientMetrics::default());
+    if let Some(metrics_listen) = config.metrics_listen {
+        crate::metrics::spawn_client_exporter(metrics_listen, metrics.clone());
+    }
 
     let mut transport_config = quinn::TransportConfig::default();
 
@@ -285,24 +431,22 @@ pub async fn run_client(config_path: &str) -> Result<()> {
     transport_config.datagram_receive_buffer_size(Some(65536));
     transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
 
-    // Apply user overrides
-    if let Some(secs) = config.max_idle_time_secs {
-        if let Ok(timeout) = std::time::Duration::from_secs(secs).try_into() {
-            transport_config.max_idle_timeout(Some(timeout));
-        }
-    } else {
-        // Reduced idle timeout to 10s so that we reconnect quickly if server disappears
-        if let Ok(timeout) = std::time::Duration::from_secs(10).try_into() {
-            transport_config.max_idle_timeout(Some(timeout));
-        }
+    // Apply unified session governance connection idle timeout
+    if let Ok(timeout) = session_policy.connection_idle_timeout.try_into() {
+        transport_config.max_idle_timeout(Some(timeout));
     }
     if let Some(cc) = &config.congestion_control {
         match cc.to_lowercase().as_str() {
             "bbr" => {
-                transport_config.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+                transport_config.congestion_controller_factory(Arc::new(
+                    quinn::congestion::BbrConfig::default(),
+                ));
             }
             "cubic" => {} // Default
-            _ => warn!("Unknown congestion control algorithm: {}, using default", cc),
+            _ => warn!(
+                "Unknown congestion control algorithm: {}, using default",
+                cc
+            ),
         }
     }
 
@@ -317,92 +461,139 @@ pub async fn run_client(config_path: &str) -> Result<()> {
     // Start SOCKS5 listener (shared across reconnections)
     let listener = Arc::new(TcpListener::bind(config.socks5_listen).await?);
     info!("SOCKS5 listening on {}", config.socks5_listen);
-    
+
+    let inbound_handler_limiter = Arc::new(Semaphore::new(max_inbound_connections));
+    let uni_stream_task_limiter = Arc::new(Semaphore::new(max_uni_stream_tasks));
+
     // Auto-reconnect loop with exponential backoff
     let mut backoff_secs = 1u64;
     const MAX_BACKOFF: u64 = 60;
 
-    let transport_mode = config.transport.clone().unwrap_or_else(|| "auto".to_string()).to_lowercase();
+    let transport_mode = config
+        .transport
+        .clone()
+        .unwrap_or_else(|| "auto".to_string())
+        .to_lowercase();
+    let mut connect_iteration = 0u64;
 
     loop {
-        info!("Connecting to {}... (mode: {})", config.server, transport_mode);
+        if connect_iteration > 0 {
+            metrics.inc_reconnects();
+        }
+        connect_iteration = connect_iteration.saturating_add(1);
+        metrics.inc_connect_attempts();
 
-        // Refresh Reality token/session id on every reconnect attempt.
-        let base_tls_config = build_tls_config(&config)?;
-        let mut client_config = quinn::ClientConfig::new(Arc::new(
-            quinn::crypto::rustls::QuicClientConfig::try_from(base_tls_config.clone())?,
-        ));
-        client_config.transport_config(transport_config.clone());
-        endpoint.set_default_client_config(client_config);
-
-        let mut tcp_tls_config = base_tls_config;
-        tcp_tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        info!(
+            event = "client_connect_attempt",
+            server = %config.server,
+            mode = %transport_mode,
+            attempt = connect_iteration,
+            "connecting to server"
+        );
 
         let mut connected_inner = None;
         let mut tcp_read_half: Option<Box<dyn tokio::io::AsyncRead + Unpin + Send>> = None;
 
-        if transport_mode == "udp" || transport_mode == "auto" {
-            match endpoint.connect(config.server, &config.server_name) {
-                Ok(connecting) => {
-                    let timeout = tokio::time::sleep(std::time::Duration::from_secs(if transport_mode == "auto" { 3 } else { 10 }));
-                    tokio::select! {
-                        res = connecting => {
-                            match res {
-                                Ok(c) => {
-                                    info!("Connected to server {} via QUIC (UDP)", config.server);
-                                    connected_inner = Some(seacore_protocol::quic::InnerConn::Quic(c));
-                                }
-                                Err(e) => {
-                                    if transport_mode == "udp" {
-                                        warn!("QUIC connection failed: {}", e);
-                                    }
-                                }
-                            }
-                        }
-                        _ = timeout => {
-                            if transport_mode == "udp" {
-                                warn!("QUIC connection timed out");
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    if transport_mode == "udp" {
-                        warn!("QUIC connect error: {}", e);
-                    }
-                }
-            }
-        }
+        {
+            let _reality_handshake_guard = reality_handshake_lock().lock().await;
 
-        if connected_inner.is_none() && (transport_mode == "tcp" || transport_mode == "auto") {
-            if transport_mode == "auto" {
-                info!("QUIC (UDP) failed or timed out, falling back to TCP...");
-            }
-            
-            // Connect TCP
-            match tokio::net::TcpStream::connect(config.server).await {
-                Ok(tcp_stream) => {
-                    let _ = tcp_stream.set_nodelay(true);
-                    let connector = tokio_rustls::TlsConnector::from(Arc::new(tcp_tls_config.clone()));
-                    let domain = rustls::pki_types::ServerName::try_from(config.server_name.as_str())
-                        .map_err(|e| eyre::eyre!("Invalid server name: {}", e))?
-                        .to_owned();
-                    match connector.connect(domain, tcp_stream).await {
-                        Ok(tls_stream) => {
-                            info!("Connected to server {} via TLS (TCP)", config.server);
-                            // We don't fully implement multiplexing over a single TCP stream yet for SeaCore connect/dissociate.
-                            // But for simple packet tunneling, wrapping it in InnerConn works. Needs a loop handling.
-                            let (r, w) = tokio::io::split(tls_stream);
-                            connected_inner = Some(seacore_protocol::quic::InnerConn::Tcp(Arc::new(tokio::sync::Mutex::new(Box::new(w)))));
-                            tcp_read_half = Some(Box::new(r));
+            // Refresh Reality token/session id on every reconnect attempt.
+            let base_tls_config = build_tls_config(&config)?;
+            let mut client_config = quinn::ClientConfig::new(Arc::new(
+                quinn::crypto::rustls::QuicClientConfig::try_from(base_tls_config.clone())?,
+            ));
+            client_config.transport_config(transport_config.clone());
+            endpoint.set_default_client_config(client_config);
+
+            let mut tcp_tls_config = base_tls_config;
+            tcp_tls_config.alpn_protocols =
+                browser_profile_from_config(&config).tcp_alpn_protocols();
+            let handshake_timeout = session_policy.handshake_timeout;
+
+            if transport_mode == "udp" || transport_mode == "auto" {
+                match endpoint.connect(config.server, &config.server_name) {
+                    Ok(connecting) => {
+                        match tokio::time::timeout(handshake_timeout, connecting).await {
+                            Ok(Ok(c)) => {
+                                info!("Connected to server {} via QUIC (UDP)", config.server);
+                                connected_inner = Some(seacore_protocol::quic::InnerConn::Quic(c));
+                            }
+                            Ok(Err(e)) => {
+                                if transport_mode == "udp" {
+                                    warn!("QUIC connection failed: {}", e);
+                                }
+                            }
+                            Err(_) => {
+                                if transport_mode == "udp" {
+                                    warn!(
+                                        "QUIC connection timed out after {}s",
+                                        handshake_timeout.as_secs()
+                                    );
+                                }
+                            }
                         }
-                        Err(e) => {
-                            warn!("TLS over TCP failed: {}", e);
+                    }
+                    Err(e) => {
+                        if transport_mode == "udp" {
+                            warn!("QUIC connect error: {}", e);
                         }
                     }
                 }
-                Err(e) => {
-                    warn!("TCP connect error: {}", e);
+            }
+
+            if connected_inner.is_none() && (transport_mode == "tcp" || transport_mode == "auto") {
+                if transport_mode == "auto" {
+                    metrics.inc_fallback_attempts();
+                    info!("QUIC (UDP) failed or timed out, falling back to TCP...");
+                }
+
+                // Connect TCP
+                match tokio::time::timeout(
+                    handshake_timeout,
+                    tokio::net::TcpStream::connect(config.server),
+                )
+                .await
+                {
+                    Ok(Ok(tcp_stream)) => {
+                        let _ = tcp_stream.set_nodelay(true);
+                        let connector =
+                            tokio_rustls::TlsConnector::from(Arc::new(tcp_tls_config.clone()));
+                        let domain =
+                            rustls::pki_types::ServerName::try_from(config.server_name.as_str())
+                                .map_err(|e| eyre::eyre!("Invalid server name: {}", e))?
+                                .to_owned();
+                        match tokio::time::timeout(
+                            handshake_timeout,
+                            connector.connect(domain, tcp_stream),
+                        )
+                        .await
+                        {
+                            Ok(Ok(tls_stream)) => {
+                                info!("Connected to server {} via TLS (TCP)", config.server);
+                                // We don't fully implement multiplexing over a single TCP stream yet for SeaCore connect/dissociate.
+                                // But for simple packet tunneling, wrapping it in InnerConn works. Needs a loop handling.
+                                let (r, w) = tokio::io::split(tls_stream);
+                                connected_inner = Some(seacore_protocol::quic::InnerConn::Tcp(
+                                    Arc::new(tokio::sync::Mutex::new(Box::new(w))),
+                                ));
+                                tcp_read_half = Some(Box::new(r));
+                            }
+                            Ok(Err(e)) => {
+                                warn!("TLS over TCP failed: {}", e);
+                            }
+                            Err(_) => warn!(
+                                "TLS over TCP timed out after {}s",
+                                handshake_timeout.as_secs()
+                            ),
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        warn!("TCP connect error: {}", e);
+                    }
+                    Err(_) => warn!(
+                        "TCP connect timed out after {}s",
+                        handshake_timeout.as_secs()
+                    ),
                 }
             }
         }
@@ -410,7 +601,10 @@ pub async fn run_client(config_path: &str) -> Result<()> {
         let conn = match connected_inner {
             Some(c) => c,
             None => {
-                warn!("All connection attempts failed. Retrying in {}s...", backoff_secs);
+                warn!(
+                    "All connection attempts failed. Retrying in {}s...",
+                    backoff_secs
+                );
                 tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
                 backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF);
                 continue;
@@ -420,13 +614,37 @@ pub async fn run_client(config_path: &str) -> Result<()> {
         let seacore_conn = Connection::<side::Client>::new(conn.clone());
 
         // Authenticate
-        if let Err(e) = seacore_conn.authenticate(config.uuid, &config.password).await {
-            warn!("Authentication failed: {}. Retrying in {}s...", e, backoff_secs);
-            tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
-            backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF);
-            continue;
+        match tokio::time::timeout(
+            session_policy.handshake_timeout,
+            seacore_conn.authenticate(config.uuid, &config.password),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                metrics.inc_auth_failures();
+                warn!(
+                    "Authentication failed: {}. Retrying in {}s...",
+                    e, backoff_secs
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF);
+                continue;
+            }
+            Err(_) => {
+                metrics.inc_auth_failures();
+                warn!(
+                    "Authentication timed out after {}s. Retrying in {}s...",
+                    session_policy.handshake_timeout.as_secs(),
+                    backoff_secs
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF);
+                continue;
+            }
         }
         info!("Authenticated as {}", config.uuid);
+        metrics.inc_connect_success();
 
         // Reset backoff on successful connection
         backoff_secs = 1;
@@ -447,15 +665,15 @@ pub async fn run_client(config_path: &str) -> Result<()> {
             let mut seq_id = 0;
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                
+
                 if let Err(e) = seacore_conn_hb.heartbeat().await {
                     warn!("Heartbeat failed: {}. Triggering reconnect.", e);
                     let _ = disconnect_tx_hb.send(true);
                     break;
                 }
-                
-                if let Ok(duration) = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
+
+                if let Ok(duration) =
+                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                 {
                     let now = duration.as_millis() as u64;
                     if let Err(e) = seacore_conn_hb.ping(seq_id, now).await {
@@ -479,7 +697,7 @@ pub async fn run_client(config_path: &str) -> Result<()> {
                 // Random interval: 2-8 seconds
                 let delay = rng.gen_range(2..=8);
                 tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-                
+
                 // Send a heartbeat as padding traffic
                 if let Err(_) = seacore_conn_pad.heartbeat().await {
                     let _ = disconnect_tx_pad.send(true);
@@ -497,6 +715,7 @@ pub async fn run_client(config_path: &str) -> Result<()> {
         let bg_routes = udp_routes.clone();
         let bg_route_touches = udp_route_touches.clone();
         let disconnect_tx_bg = disconnect_tx.clone();
+        let uni_stream_task_limiter_bg = uni_stream_task_limiter.clone();
         let mut tcp_read = tcp_read_half;
         let bg_task = tokio::spawn(async move {
             match bg_conn {
@@ -552,10 +771,21 @@ pub async fn run_client(config_path: &str) -> Result<()> {
                             uni = q.accept_uni() => {
                                 match uni {
                                     Ok(recv) => {
+                                        let permit = match uni_stream_task_limiter_bg.clone().try_acquire_owned() {
+                                            Ok(permit) => permit,
+                                            Err(_) => {
+                                                warn!(
+                                                    "Dropping inbound uni-stream because max_uni_stream_tasks={} was reached",
+                                                    max_uni_stream_tasks
+                                                );
+                                                continue;
+                                            }
+                                        };
                                         let bg_seacore_clone = bg_seacore.clone();
                                         let bg_routes_clone = bg_routes.clone();
                                         let bg_route_touches_clone = bg_route_touches.clone();
                                         tokio::spawn(async move {
+                                            let _permit = permit;
                                             if let Ok(Task::Packet(pkt)) = bg_seacore_clone.accept_uni_stream(seacore_protocol::quic::SeaCoreReadStream::Quic(recv)).await {
                                                 let assoc_id = pkt.assoc_id();
                                                 let addr = pkt.addr().clone();
@@ -591,38 +821,39 @@ pub async fn run_client(config_path: &str) -> Result<()> {
                         let bg_route_touches_clone = bg_route_touches.clone();
                         loop {
                             match bg_seacore_clone.next_tcp_task(recv.as_mut()).await {
-                                Ok(task) => {
-                                    match task {
-                                        Task::Packet(pkt) => {
-                                            let assoc_id = pkt.assoc_id();
-                                            let addr = pkt.addr().clone();
-                                            if let Ok(payload) = pkt.payload().await {
-                                                {
-                                                    let mut touches = bg_route_touches_clone.lock().await;
-                                                    touches.insert(assoc_id, Instant::now());
-                                                }
-                                                let tx_opt = {
-                                                    let routes = bg_routes_clone.lock().await;
-                                                    routes.get(&assoc_id).cloned()
-                                                };
-                                                if let Some(tx) = tx_opt {
-                                                    let _ = tx.send((payload, addr)).await;
-                                                }
+                                Ok(task) => match task {
+                                    Task::Packet(pkt) => {
+                                        let assoc_id = pkt.assoc_id();
+                                        let addr = pkt.addr().clone();
+                                        if let Ok(payload) = pkt.payload().await {
+                                            {
+                                                let mut touches =
+                                                    bg_route_touches_clone.lock().await;
+                                                touches.insert(assoc_id, Instant::now());
+                                            }
+                                            let tx_opt = {
+                                                let routes = bg_routes_clone.lock().await;
+                                                routes.get(&assoc_id).cloned()
+                                            };
+                                            if let Some(tx) = tx_opt {
+                                                let _ = tx.send((payload, addr)).await;
                                             }
                                         }
-                                        Task::Ping { seq_id, timestamp } => {
-                                            if let Ok(duration) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-                                                let now = duration.as_millis() as u64;
-                                                if now >= timestamp {
-                                                    let rtt = now - timestamp;
-                                                    info!("Ping seq {} RTT: {} ms", seq_id, rtt);
-                                                }
-                                            }
-                                        }
-                                        Task::Heartbeat => {}
-                                        _ => {}
                                     }
-                                }
+                                    Task::Ping { seq_id, timestamp } => {
+                                        if let Ok(duration) = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                        {
+                                            let now = duration.as_millis() as u64;
+                                            if now >= timestamp {
+                                                let rtt = now - timestamp;
+                                                info!("Ping seq {} RTT: {} ms", seq_id, rtt);
+                                            }
+                                        }
+                                    }
+                                    Task::Heartbeat => {}
+                                    _ => {}
+                                },
                                 Err(e) => {
                                     warn!("TCP connection loop error: {}", e);
                                     let _ = disconnect_tx_bg.send(true);
@@ -678,6 +909,8 @@ pub async fn run_client(config_path: &str) -> Result<()> {
         let listener_ref = listener.clone();
         let config_socks = config.clone();
         let idle_policy_socks = idle_policy.clone();
+        let session_policy_socks = session_policy.clone();
+        let inbound_handler_limiter_socks = inbound_handler_limiter.clone();
         let socks_task = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -687,13 +920,26 @@ pub async fn run_client(config_path: &str) -> Result<()> {
                     accept = listener_ref.accept() => {
                         match accept {
                             Ok((stream, peer_addr)) => {
+                                let permit = match inbound_handler_limiter_socks.clone().try_acquire_owned() {
+                                    Ok(permit) => permit,
+                                    Err(_) => {
+                                        warn!(
+                                            "Rejecting inbound {} because max_inbound_connections={} was reached",
+                                            peer_addr,
+                                            max_inbound_connections
+                                        );
+                                        continue;
+                                    }
+                                };
                                 let sc = seacore_conn.clone();
                                 let ur = udp_routes.clone();
                                 let ut = udp_route_touches.clone();
                                 let ip = idle_policy_socks.clone();
+                                let sp = session_policy_socks.clone();
                                 let cfg = config_socks.clone();
                                 tokio::spawn(async move {
-                                    if let Err(e) = handle_inbound(stream, sc, peer_addr, ur, ut, ip, cfg).await {
+                                    let _permit = permit;
+                                    if let Err(e) = handle_inbound(stream, sc, peer_addr, ur, ut, ip, sp, cfg).await {
                                         warn!("Inbound handler error for {}: {}", peer_addr, e);
                                     }
                                 });
@@ -729,14 +975,38 @@ async fn handle_inbound(
     udp_routes: UdpRoutes,
     udp_route_touches: UdpRouteTouches,
     idle_policy: Arc<IdleSessionPolicy>,
+    session_policy: Arc<SessionGovernancePolicy>,
     config: Arc<ClientConfig>,
 ) -> Result<()> {
     let mut version_buf = [0u8; 1];
     stream.read_exact(&mut version_buf).await?;
-    
+
     match version_buf[0] {
-        0x05 => handle_socks5_logic(stream, conn, peer_addr, udp_routes, udp_route_touches, idle_policy, config).await,
-        0x04 => handle_socks4(stream, conn, peer_addr, idle_policy.timeout, config).await,
+        0x05 => {
+            handle_socks5_logic(
+                stream,
+                conn,
+                peer_addr,
+                udp_routes,
+                udp_route_touches,
+                idle_policy,
+                session_policy.clone(),
+                config,
+            )
+            .await
+        }
+        0x04 => {
+            handle_socks4(
+                stream,
+                conn,
+                peer_addr,
+                session_policy.connection_idle_timeout,
+                session_policy.half_close_timeout,
+                session_policy.handshake_timeout,
+                config,
+            )
+            .await
+        }
         v => Err(eyre::eyre!("unsupported proxy version: {}", v)),
     }
 }
@@ -745,6 +1015,7 @@ async fn relay_until_either_side_finishes<L, R>(
     left: L,
     right: R,
     relay_idle_timeout: Duration,
+    half_close_timeout: Duration,
 ) -> std::io::Result<()>
 where
     L: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -756,27 +1027,64 @@ where
     let mut right_buf = vec![0u8; 8192];
 
     let relay_result = async {
+        let mut left_closed = false;
+        let mut right_closed = false;
+        let mut half_close_deadline: Option<Instant> = None;
+
         loop {
+            if left_closed && right_closed {
+                return Ok(());
+            }
+
+            let wait_budget = match half_close_deadline {
+                Some(deadline) => {
+                    let remain = deadline.saturating_duration_since(Instant::now());
+                    if remain.is_zero() {
+                        return Ok(());
+                    }
+                    remain.min(relay_idle_timeout)
+                }
+                None => relay_idle_timeout,
+            };
+
             tokio::select! {
-                left_read_result = tokio::time::timeout(relay_idle_timeout, left_read.read(&mut left_buf)) => {
+                left_read_result = tokio::time::timeout(wait_budget, left_read.read(&mut left_buf)), if !left_closed => {
                     let n = match left_read_result {
                         Ok(Ok(n)) => n,
                         Ok(Err(e)) => return Err(e),
-                        Err(_) => return Ok(()), // Idle timeout.
+                        Err(_) => return Ok(()),
                     };
                     if n == 0 {
-                        return Ok(());
+                        left_closed = true;
+                        if half_close_deadline.is_none() {
+                            half_close_deadline = Some(Instant::now() + half_close_timeout);
+                        }
+                        let _ = tokio::time::timeout(
+                            Duration::from_millis(200),
+                            tokio::io::AsyncWriteExt::shutdown(&mut right_write),
+                        )
+                        .await;
+                        continue;
                     }
                     right_write.write_all(&left_buf[..n]).await?;
                 }
-                right_read_result = tokio::time::timeout(relay_idle_timeout, right_read.read(&mut right_buf)) => {
+                right_read_result = tokio::time::timeout(wait_budget, right_read.read(&mut right_buf)), if !right_closed => {
                     let n = match right_read_result {
                         Ok(Ok(n)) => n,
                         Ok(Err(e)) => return Err(e),
-                        Err(_) => return Ok(()), // Idle timeout.
+                        Err(_) => return Ok(()),
                     };
                     if n == 0 {
-                        return Ok(());
+                        right_closed = true;
+                        if half_close_deadline.is_none() {
+                            half_close_deadline = Some(Instant::now() + half_close_timeout);
+                        }
+                        let _ = tokio::time::timeout(
+                            Duration::from_millis(200),
+                            tokio::io::AsyncWriteExt::shutdown(&mut left_write),
+                        )
+                        .await;
+                        continue;
                     }
                     left_write.write_all(&right_buf[..n]).await?;
                 }
@@ -827,79 +1135,124 @@ async fn handle_socks4(
     mut stream: tokio::net::TcpStream,
     conn: Connection<side::Client>,
     peer_addr: SocketAddr,
-    relay_idle_timeout: Duration,
+    connection_idle_timeout: Duration,
+    half_close_timeout: Duration,
+    handshake_timeout: Duration,
     config: Arc<ClientConfig>,
 ) -> Result<()> {
     // SOCKS4 handshake (already read VN=0x04)
     let mut buf = [0u8; 8];
     stream.read_exact(&mut buf[..7]).await?;
-    
+
     let cmd = buf[0];
     if cmd != 0x01 {
         // Only CONNECT supported
-        stream.write_all(&[0x00, 0x5B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]).await?;
+        stream
+            .write_all(&[0x00, 0x5B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+            .await?;
         return Err(eyre::eyre!("unsupported SOCKS4 command: {}", cmd));
     }
-    
+
     let port = u16::from_be_bytes([buf[1], buf[2]]);
     let ip = std::net::Ipv4Addr::new(buf[3], buf[4], buf[5], buf[6]);
-    
+
     // Read USERID (NULL terminated)
     let mut userid = Vec::new();
     loop {
         let mut b = [0u8; 1];
         stream.read_exact(&mut b).await?;
-        if b[0] == 0 { break; }
+        if b[0] == 0 {
+            break;
+        }
         userid.push(b[0]);
     }
-    
-    let addr = if ip.octets()[0] == 0 && ip.octets()[1] == 0 && ip.octets()[2] == 0 && ip.octets()[3] != 0 {
-        // SOCKS4a: Domain follows USERID
-        let mut domain = Vec::new();
-        loop {
-            let mut b = [0u8; 1];
-            stream.read_exact(&mut b).await?;
-            if b[0] == 0 { break; }
-            domain.push(b[0]);
-        }
-        Address::DomainAddress(String::from_utf8_lossy(&domain).to_string(), port)
-    } else {
-        Address::SocketAddress(SocketAddr::new(std::net::IpAddr::V4(ip), port))
-    };
-    
+
+    let addr =
+        if ip.octets()[0] == 0 && ip.octets()[1] == 0 && ip.octets()[2] == 0 && ip.octets()[3] != 0
+        {
+            // SOCKS4a: Domain follows USERID
+            let mut domain = Vec::new();
+            loop {
+                let mut b = [0u8; 1];
+                stream.read_exact(&mut b).await?;
+                if b[0] == 0 {
+                    break;
+                }
+                domain.push(b[0]);
+            }
+            Address::DomainAddress(String::from_utf8_lossy(&domain).to_string(), port)
+        } else {
+            Address::SocketAddress(SocketAddr::new(std::net::IpAddr::V4(ip), port))
+        };
+
     // Choose transport
     let transport_mode = config.transport.as_deref().unwrap_or("auto").to_lowercase();
 
     if transport_mode == "tcp" {
         // 1:1 TCP fallback
         let server_addr = config.server;
-        let tcp_stream = tokio::net::TcpStream::connect(server_addr).await?;
-        let tcp_tls_config = build_tls_config(&config)?;
-        let connector = tokio_rustls::TlsConnector::from(Arc::new(tcp_tls_config));
-        
-        let domain_sni = config.reality.as_ref().map(|r| r.server_name.clone()).unwrap_or_else(|| "apple.com".into());
-        let server_name = rustls::pki_types::ServerName::try_from(domain_sni.as_str())?.to_owned();
-        
-        let mut tls_stream = connector.connect(server_name, tcp_stream).await?;
-        
+        let tcp_stream = tokio::time::timeout(
+            handshake_timeout,
+            tokio::net::TcpStream::connect(server_addr),
+        )
+        .await
+        .map_err(|_| {
+            eyre::eyre!(
+                "SOCKS4 TCP connect timed out after {}s",
+                handshake_timeout.as_secs()
+            )
+        })??;
+        let domain_sni = config
+            .reality
+            .as_ref()
+            .map(|r| r.server_name.clone())
+            .unwrap_or_else(|| "apple.com".into());
+        let mut tls_stream = {
+            let _reality_handshake_guard = reality_handshake_lock().lock().await;
+            let tcp_tls_config = build_tls_config(&config)?;
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(tcp_tls_config));
+            let server_name =
+                rustls::pki_types::ServerName::try_from(domain_sni.as_str())?.to_owned();
+            tokio::time::timeout(
+                handshake_timeout,
+                connector.connect(server_name, tcp_stream),
+            )
+            .await
+            .map_err(|_| {
+                eyre::eyre!(
+                    "SOCKS4 TLS handshake timed out after {}s",
+                    handshake_timeout.as_secs()
+                )
+            })??
+        };
+
         // Authenticate
         let uuid = config.uuid;
         let model = seacore_protocol::model::Connection::<Vec<u8>>::new();
         let auth_data = model.send_authenticate(uuid, &config.password, None::<&NoExporter>);
         let header = seacore_protocol::protocol::Header::Authenticate(auth_data);
         header.async_marshal(&mut tls_stream).await?;
-        
+
         // Connect
         let conn_data = model.send_connect(addr.clone());
         let header_conn = seacore_protocol::protocol::Header::Connect(conn_data);
         header_conn.async_marshal(&mut tls_stream).await?;
-        
-        info!("SOCKS4 TCP Fallback: {} -> {}", peer_addr, addr);
-        
-        // Reply: Granted
-        stream.write_all(&[0x00, 0x5A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]).await?;
 
-        if let Err(e) = relay_until_either_side_finishes(stream, tls_stream, relay_idle_timeout).await {
+        info!("SOCKS4 TCP Fallback: {} -> {}", peer_addr, addr);
+
+        // Reply: Granted
+        stream
+            .write_all(&[0x00, 0x5A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+            .await?;
+
+        if let Err(e) = relay_until_either_side_finishes(
+            stream,
+            tls_stream,
+            connection_idle_timeout,
+            half_close_timeout,
+        )
+        .await
+        {
             log_relay_error("SOCKS4 TCP relay error", peer_addr, e);
         }
     } else {
@@ -908,19 +1261,30 @@ async fn handle_socks4(
             Ok(bistream) => {
                 info!("SOCKS4 QUIC: {} -> {}", peer_addr, addr);
                 // Reply: Granted
-                stream.write_all(&[0x00, 0x5A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]).await?;
+                stream
+                    .write_all(&[0x00, 0x5A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+                    .await?;
 
-                if let Err(e) = relay_until_either_side_finishes(stream, bistream, relay_idle_timeout).await {
+                if let Err(e) = relay_until_either_side_finishes(
+                    stream,
+                    bistream,
+                    connection_idle_timeout,
+                    half_close_timeout,
+                )
+                .await
+                {
                     log_relay_error("SOCKS4 QUIC relay error", peer_addr, e);
                 }
             }
             Err(e) => {
                 warn!("SOCKS4 QUIC connection failed for {}: {}", addr, e);
-                stream.write_all(&[0x00, 0x5B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]).await?;
+                stream
+                    .write_all(&[0x00, 0x5B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+                    .await?;
             }
         }
     }
-    
+
     Ok(())
 }
 
@@ -931,6 +1295,7 @@ async fn handle_socks5_logic(
     udp_routes: UdpRoutes,
     udp_route_touches: UdpRouteTouches,
     idle_policy: Arc<IdleSessionPolicy>,
+    session_policy: Arc<SessionGovernancePolicy>,
     config: Arc<ClientConfig>,
 ) -> Result<()> {
     // ── SOCKS5 handshake ──────────────────────────
@@ -949,7 +1314,9 @@ async fn handle_socks5_logic(
     let cmd = buf[1];
     if buf[0] != 0x05 || (cmd != 0x01 && cmd != 0x03) {
         // Only CONNECT and UDP ASSOCIATE supported
-        stream.write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+        stream
+            .write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await?;
         return Err(eyre::eyre!("unsupported SOCKS5 command: {}", buf[1]));
     }
 
@@ -980,16 +1347,37 @@ async fn handle_socks5_logic(
             Address::SocketAddress(SocketAddr::from((ip, port)))
         }
         _ => {
-            stream.write_all(&[0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+            stream
+                .write_all(&[0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await?;
             return Err(eyre::eyre!("unsupported address type: {}", buf[3]));
         }
     };
 
     if cmd == 0x03 {
         // UDP ASSOCIATE
+        let current_udp_assocs = udp_routes.lock().await.len();
+        let udp_assoc_limit = config
+            .max_udp_associations
+            .unwrap_or(DEFAULT_MAX_UDP_ASSOCIATIONS)
+            .max(1);
+        if current_udp_assocs >= udp_assoc_limit {
+            warn!(
+                "Rejecting UDP ASSOCIATE for {} because max_udp_associations={} was reached",
+                peer_addr, udp_assoc_limit
+            );
+            stream
+                .write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await?;
+            return Err(eyre::eyre!(
+                "udp association limit reached ({})",
+                udp_assoc_limit
+            ));
+        }
+
         let local_socket = UdpSocket::bind("0.0.0.0:0").await?;
         let bind_addr = local_socket.local_addr()?;
-        
+
         let mut reply = vec![0x05, 0x00, 0x00];
         match bind_addr {
             SocketAddr::V4(v4) => {
@@ -1032,15 +1420,18 @@ async fn handle_socks5_logic(
         let assoc_id = NEXT_ASSOC_ID.fetch_add(1, Ordering::SeqCst);
         let (tx, mut rx) = mpsc::channel(1024);
         udp_routes.lock().await.insert(assoc_id, tx);
-        udp_route_touches.lock().await.insert(assoc_id, Instant::now());
+        udp_route_touches
+            .lock()
+            .await
+            .insert(assoc_id, Instant::now());
 
         let socket_arc = Arc::new(local_socket);
         let socket_recv = socket_arc.clone();
-        
+
         let client_udp_addr = Arc::new(Mutex::new(None));
         let upload_client_addr = client_udp_addr.clone();
         let route_touches_upload = udp_route_touches.clone();
-        
+
         let client_conn = conn.clone();
         // Task to read UDP from client and send over QUIC
         let upload_task = tokio::spawn(async move {
@@ -1049,7 +1440,10 @@ async fn handle_socks5_logic(
                 match socket_recv.recv_from(&mut buf).await {
                     Ok((n, client_addr)) => {
                         *upload_client_addr.lock().await = Some(client_addr);
-                        route_touches_upload.lock().await.insert(assoc_id, Instant::now());
+                        route_touches_upload
+                            .lock()
+                            .await
+                            .insert(assoc_id, Instant::now());
                         let data = &buf[..n];
                         // Parse SOCKS5 UDP header
                         if data.len() < 10 || data[0] != 0 || data[1] != 0 {
@@ -1059,21 +1453,28 @@ async fn handle_socks5_logic(
                         if frag != 0 {
                             continue; // We dont support SOCKS UDP fragmentation
                         }
-                        
+
                         let atyp = data[3];
                         let (dest_addr, payload_idx) = match atyp {
                             0x01 if data.len() >= 10 => {
-                                let ip = std::net::Ipv4Addr::new(data[4], data[5], data[6], data[7]);
+                                let ip =
+                                    std::net::Ipv4Addr::new(data[4], data[5], data[6], data[7]);
                                 let port = u16::from_be_bytes([data[8], data[9]]);
                                 (Address::SocketAddress(SocketAddr::from((ip, port))), 10)
                             }
                             0x03 if data.len() >= 5 => {
                                 let domain_len = data[4] as usize;
                                 if data.len() >= 5 + domain_len + 2 {
-                                    let domain = String::from_utf8_lossy(&data[5..5+domain_len]).to_string();
-                                    let port = u16::from_be_bytes([data[5+domain_len], data[6+domain_len]]);
+                                    let domain = String::from_utf8_lossy(&data[5..5 + domain_len])
+                                        .to_string();
+                                    let port = u16::from_be_bytes([
+                                        data[5 + domain_len],
+                                        data[6 + domain_len],
+                                    ]);
                                     (Address::DomainAddress(domain, port), 5 + domain_len + 2)
-                                } else { continue; }
+                                } else {
+                                    continue;
+                                }
                             }
                             0x04 if data.len() >= 22 => {
                                 let mut ip_bytes = [0u8; 16];
@@ -1084,10 +1485,18 @@ async fn handle_socks5_logic(
                             }
                             _ => continue,
                         };
-                        
+
                         let payload = &data[payload_idx..];
-                        // Send over QUIC (datagram)
-                        let _ = client_conn.packet_native(payload, dest_addr, assoc_id);
+                        // Send over QUIC/TCP-native transport.
+                        if let Err(e) = client_conn
+                            .packet_native(payload, dest_addr, assoc_id)
+                            .await
+                        {
+                            debug!(
+                                "UDP upstream send failed for assoc {} ({}): {}",
+                                assoc_id, peer_addr, e
+                            );
+                        }
                     }
                     Err(_) => break,
                 }
@@ -1150,45 +1559,79 @@ async fn handle_socks5_logic(
         let _ = conn.dissociate(assoc_id).await;
         udp_routes.lock().await.remove(&assoc_id);
         udp_route_touches.lock().await.remove(&assoc_id);
-        
+
         return Ok(());
     }
 
     info!("SOCKS5 TCP connect {} -> {}", peer_addr, addr);
 
     let transport_mode = config.transport.as_deref().unwrap_or("auto").to_lowercase();
-    
+
     let remote = if transport_mode == "tcp" {
         // --- Phase 19/15: 1:1 Transparent TCP TLS Fallback ---
-        let tcp_tls_config = build_tls_config(&config)?;
-        let connector = tokio_rustls::TlsConnector::from(Arc::new(tcp_tls_config));
-        
         let server_addr = config.server;
-        let tcp_stream = tokio::net::TcpStream::connect(server_addr).await?;
-        
-        let domain = config.reality.as_ref().map(|r| r.server_name.clone()).unwrap_or_else(|| "apple.com".into());
-        let server_name = rustls::pki_types::ServerName::try_from(domain.as_str())?.to_owned();
-        
+        let tcp_stream = tokio::time::timeout(
+            session_policy.handshake_timeout,
+            tokio::net::TcpStream::connect(server_addr),
+        )
+        .await
+        .map_err(|_| {
+            eyre::eyre!(
+                "SOCKS5 TCP connect timed out after {}s",
+                session_policy.handshake_timeout.as_secs()
+            )
+        })??;
+
+        let domain = config
+            .reality
+            .as_ref()
+            .map(|r| r.server_name.clone())
+            .unwrap_or_else(|| "apple.com".into());
         // 1. Establish TLS with Reality Tokens
-        let mut tls_stream = connector.connect(server_name, tcp_stream).await?;
-        
+        let mut tls_stream = {
+            let _reality_handshake_guard = reality_handshake_lock().lock().await;
+            let tcp_tls_config = build_tls_config(&config)?;
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(tcp_tls_config));
+            let server_name = rustls::pki_types::ServerName::try_from(domain.as_str())?.to_owned();
+            tokio::time::timeout(
+                session_policy.handshake_timeout,
+                connector.connect(server_name, tcp_stream),
+            )
+            .await
+            .map_err(|_| {
+                eyre::eyre!(
+                    "SOCKS5 TLS handshake timed out after {}s",
+                    session_policy.handshake_timeout.as_secs()
+                )
+            })??
+        };
+
         // 2. Send Authenticate Command manually over the raw TLS stream
         let uuid = config.uuid;
         let model = seacore_protocol::model::Connection::<Vec<u8>>::new();
         let auth_data = model.send_authenticate(uuid, &config.password, None::<&NoExporter>);
         let header = seacore_protocol::protocol::Header::Authenticate(auth_data);
         header.async_marshal(&mut tls_stream).await?;
-        
+
         // 3. Send Connect Command
         let conn_data = model.send_connect(addr.clone());
         let header_conn = seacore_protocol::protocol::Header::Connect(conn_data);
         header_conn.async_marshal(&mut tls_stream).await?;
 
         info!("SOCKS5 TCP Fallback: {} -> {}", peer_addr, addr);
-        
-        stream.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
 
-        if let Err(e) = relay_until_either_side_finishes(stream, tls_stream, idle_policy.timeout).await {
+        stream
+            .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await?;
+
+        if let Err(e) = relay_until_either_side_finishes(
+            stream,
+            tls_stream,
+            session_policy.connection_idle_timeout,
+            session_policy.half_close_timeout,
+        )
+        .await
+        {
             log_relay_error("SOCKS5 TCP relay error", peer_addr, e);
         }
         return Ok(());
@@ -1197,64 +1640,151 @@ async fn handle_socks5_logic(
         match conn.connect(addr).await {
             Ok(s) => s,
             Err(e) => {
-                stream.write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+                stream
+                    .write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                    .await?;
                 return Err(eyre::eyre!("SeaCore connect failed: {}", e));
             }
         }
     };
 
     // SOCKS5 success reply
-    stream.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+    stream
+        .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await?;
 
-    if let Err(e) = relay_until_either_side_finishes(stream, remote, idle_policy.timeout).await {
+    if let Err(e) = relay_until_either_side_finishes(
+        stream,
+        remote,
+        session_policy.connection_idle_timeout,
+        session_policy.half_close_timeout,
+    )
+    .await
+    {
         log_relay_error("SOCKS5 QUIC relay error", peer_addr, e);
     }
 
     Ok(())
 }
 
-// ── Skip TLS verification (dev only) ──────────
+fn parse_cert_sha256_pin(raw: &str) -> Result<[u8; 32]> {
+    let normalized: String = raw
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace() && *c != ':' && *c != '-')
+        .collect();
+
+    if normalized.len() == 64 && normalized.chars().all(|c| c.is_ascii_hexdigit()) {
+        let mut out = [0u8; 32];
+        for (idx, byte) in out.iter_mut().enumerate() {
+            let hi = normalized
+                .as_bytes()
+                .get(idx * 2)
+                .ok_or_else(|| eyre::eyre!("invalid pin length"))?;
+            let lo = normalized
+                .as_bytes()
+                .get(idx * 2 + 1)
+                .ok_or_else(|| eyre::eyre!("invalid pin length"))?;
+
+            let pair = [*hi as char, *lo as char];
+            let byte_str: String = pair.iter().collect();
+            *byte = u8::from_str_radix(&byte_str, 16)
+                .map_err(|_| eyre::eyre!("invalid hex in server_cert_sha256"))?;
+        }
+        return Ok(out);
+    }
+
+    use base64::{engine::general_purpose, Engine as _};
+    let decoded = general_purpose::STANDARD
+        .decode(&normalized)
+        .or_else(|_| general_purpose::URL_SAFE_NO_PAD.decode(&normalized))
+        .or_else(|_| general_purpose::URL_SAFE.decode(&normalized))
+        .map_err(|_| {
+            eyre::eyre!(
+                "invalid server_cert_sha256 format (expected 64-char hex or base64-encoded SHA-256)"
+            )
+        })?;
+
+    if decoded.len() != 32 {
+        return Err(eyre::eyre!(
+            "invalid server_cert_sha256 length {}, expected 32 bytes",
+            decoded.len()
+        ));
+    }
+
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&decoded);
+    Ok(out)
+}
 
 #[derive(Debug)]
-struct SkipVerification;
+struct SeaCoreServerVerifier {
+    webpki: Arc<rustls::client::WebPkiServerVerifier>,
+    allow_invalid_cert_chain: bool,
+    pinned_sha256: Option<[u8; 32]>,
+}
 
-impl rustls::client::danger::ServerCertVerifier for SkipVerification {
+impl rustls::client::danger::ServerCertVerifier for SeaCoreServerVerifier {
     fn verify_server_cert(
         &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if !self.allow_invalid_cert_chain {
+            rustls::client::danger::ServerCertVerifier::verify_server_cert(
+                self.webpki.as_ref(),
+                end_entity,
+                intermediates,
+                server_name,
+                ocsp_response,
+                now,
+            )?;
+        }
+
+        if let Some(expected_pin) = self.pinned_sha256 {
+            let actual = ring::digest::digest(&ring::digest::SHA256, end_entity.as_ref());
+            if actual.as_ref() != expected_pin.as_slice() {
+                return Err(rustls::Error::General(
+                    "server certificate SHA-256 pin mismatch".to_string(),
+                ));
+            }
+        }
+
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::client::danger::ServerCertVerifier::verify_tls12_signature(
+            self.webpki.as_ref(),
+            message,
+            cert,
+            dss,
+        )
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::client::danger::ServerCertVerifier::verify_tls13_signature(
+            self.webpki.as_ref(),
+            message,
+            cert,
+            dss,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            rustls::SignatureScheme::ED25519,
-        ]
+        rustls::client::danger::ServerCertVerifier::supported_verify_schemes(self.webpki.as_ref())
     }
 }
 
@@ -1268,9 +1798,7 @@ impl seacore_protocol::model::KeyingMaterialExporter for NoExporter {
 
 // --- Custom X25519 Key Exchange ---
 
-struct CustomX25519Group {
-    secret: StaticSecret,
-}
+struct CustomX25519Group;
 
 impl core::fmt::Debug for CustomX25519Group {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -1280,13 +1808,14 @@ impl core::fmt::Debug for CustomX25519Group {
 
 impl SupportedKxGroup for CustomX25519Group {
     fn start(&self) -> Result<Box<dyn ActiveKeyExchange>, rustls::Error> {
-        let pub_key = PublicKey::from(&self.secret);
+        let secret = current_reality_client_secret();
+        let pub_key = PublicKey::from(&secret);
         Ok(Box::new(CustomActiveKeyExchange {
-            secret: self.secret.clone(),
+            secret,
             pub_key: pub_key.to_bytes().to_vec(),
         }))
     }
-    
+
     fn name(&self) -> NamedGroup {
         NamedGroup::X25519
     }
@@ -1300,12 +1829,14 @@ struct CustomActiveKeyExchange {
 impl ActiveKeyExchange for CustomActiveKeyExchange {
     fn complete(self: Box<Self>, peer_pub_key: &[u8]) -> Result<SharedSecret, rustls::Error> {
         if peer_pub_key.len() != 32 {
-            return Err(rustls::Error::General("Invalid peer key length".to_string()));
+            return Err(rustls::Error::General(
+                "Invalid peer key length".to_string(),
+            ));
         }
         let mut peer_bytes = [0u8; 32];
         peer_bytes.copy_from_slice(&peer_pub_key[..32]);
         let peer_key = PublicKey::from(peer_bytes);
-        
+
         // ECDH with Server's Ephemeral Key
         let shared = self.secret.diffie_hellman(&peer_key);
         Ok(SharedSecret::from(shared.as_bytes().as_ref()))
@@ -1317,5 +1848,73 @@ impl ActiveKeyExchange for CustomActiveKeyExchange {
 
     fn group(&self) -> NamedGroup {
         NamedGroup::X25519
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn decode_varint(buf: &[u8], offset: &mut usize) -> u64 {
+        let first = buf[*offset];
+        let prefix = first >> 6;
+        let len = match prefix {
+            0 => 1,
+            1 => 2,
+            2 => 4,
+            _ => 8,
+        };
+
+        let mut value = (first & 0x3f) as u64;
+        for i in 1..len {
+            value = (value << 8) | (buf[*offset + i] as u64);
+        }
+        *offset += len;
+        value
+    }
+
+    #[test]
+    fn quic_varint_encoding_regression() {
+        let mut out = Vec::new();
+        encode_quic_varint(0, &mut out);
+        encode_quic_varint(63, &mut out);
+        encode_quic_varint(64, &mut out);
+        encode_quic_varint(16_383, &mut out);
+        encode_quic_varint(262_144, &mut out);
+
+        let mut off = 0;
+        assert_eq!(decode_varint(&out, &mut off), 0);
+        assert_eq!(decode_varint(&out, &mut off), 63);
+        assert_eq!(decode_varint(&out, &mut off), 64);
+        assert_eq!(decode_varint(&out, &mut off), 16_383);
+        assert_eq!(decode_varint(&out, &mut off), 262_144);
+    }
+
+    #[test]
+    fn h3_control_payload_has_expected_settings_shape() {
+        let payload = build_h3_control_stream_payload();
+        let mut off = 0;
+
+        let stream_type = decode_varint(&payload, &mut off);
+        assert_eq!(stream_type, 0x00);
+
+        let frame_type = decode_varint(&payload, &mut off);
+        assert_eq!(frame_type, 0x04);
+
+        let frame_len = decode_varint(&payload, &mut off) as usize;
+        assert_eq!(frame_len, payload.len() - off);
+
+        let mut setting_ids = Vec::new();
+        let end = off + frame_len;
+        while off < end {
+            let setting_id = decode_varint(&payload, &mut off);
+            let _setting_value = decode_varint(&payload, &mut off);
+            setting_ids.push(setting_id);
+        }
+
+        assert!(setting_ids.contains(&0x01)); // QPACK_MAX_TABLE_CAPACITY
+        assert!(setting_ids.contains(&0x06)); // MAX_FIELD_SECTION_SIZE
+        assert!(setting_ids.contains(&0x07)); // QPACK_BLOCKED_STREAMS
+        assert!(setting_ids.contains(&0x33)); // H3_DATAGRAM
     }
 }

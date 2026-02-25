@@ -1,9 +1,12 @@
 use clap::{Parser, Subcommand};
 use eyre::Result;
 
+mod auth_limit;
 mod client;
-mod server;
+mod metrics;
 mod router;
+mod server;
+mod session_policy;
 mod sniffer;
 
 #[derive(Parser)]

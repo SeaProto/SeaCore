@@ -1,0 +1,57 @@
+name: Test Matrix
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - "**/*.rs"
+      - "Cargo.toml"
+      - "Test/**"
+      - "docs/**"
+      - "SECURITY.md"
+      - ".github/workflows/test-matrix.yml"
+  pull_request:
+    paths:
+      - "**/*.rs"
+      - "Cargo.toml"
+      - "Test/**"
+      - "docs/**"
+      - "SECURITY.md"
+      - ".github/workflows/test-matrix.yml"
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build release binary
+        run: cargo build --release -p seacore
+
+      - name: Run protocol tests
+        run: cargo test -p seacore-protocol -- --nocapture
+
+      - name: Run deterministic matrix (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: py -3 Test/test_matrix.py --tcp-iterations 12 --udp-iterations 24
+
+      - name: Run deterministic matrix (Unix)
+        if: runner.os != 'Windows'
+        run: python3 Test/test_matrix.py --tcp-iterations 12 --udp-iterations 24

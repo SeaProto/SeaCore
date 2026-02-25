@@ -46,6 +46,10 @@ To start the server, you need a configuration file (`server.json`) and a generat
   "idle_session_check_interval_secs": 5,
   "idle_session_timeout_secs": 10,
   "min_idle_sessions": 0,
+  "handshake_timeout_secs": 5,
+  "connection_idle_timeout_secs": 10,
+  "half_close_timeout_secs": 2,
+  "metrics_listen": "127.0.0.1:9100",
   "users": [
     {
       "uuid": "your-uuid-here",
@@ -54,7 +58,7 @@ To start the server, you need a configuration file (`server.json`) and a generat
   ],
   "reality": {
     "private_key": "base64_encoded_private_key_here",
-    "short_ids": ["12345678", "abcdef12"],
+    "short_ids": ["0011223344556677", "8899aabbccddeeff"],
     "server_names": ["www.apple.com", "apple.com"],
     "dest": "www.apple.com:443"
   }
@@ -74,7 +78,12 @@ To start the client, you need a corresponding `client.json` with the matching `p
 {
     "server": "your_server_ip:4430",
     "transport": "udp",
-    "insecure_skip_verify": true,
+    "insecure_skip_verify": false,
+    "server_cert_sha256": "base64_or_hex_sha256_of_server_leaf_cert",
+    "handshake_timeout_secs": 5,
+    "connection_idle_timeout_secs": 10,
+    "half_close_timeout_secs": 2,
+    "metrics_listen": "127.0.0.1:9101",
     "idle_session_check_interval_secs": 5,
     "idle_session_timeout_secs": 10,
     "min_idle_sessions": 0,
@@ -85,10 +94,13 @@ To start the client, you need a corresponding `client.json` with the matching `p
         "profile": "chrome",
         "server_name": "www.apple.com",
         "public_key": "base64_encoded_public_key_here",
-        "short_id": "12345678"
+        "short_id": "0011223344556677"
     }
 }
 ```
+
+`insecure_skip_verify` is disabled by default and should remain `false` in production.
+For self-signed deployments, prefer using `server_cert_sha256` pinning instead of disabling verification.
 
 Start the client process:
 ```bash
@@ -102,6 +114,15 @@ Both client and server accept the same optional idle cleanup parameters:
 *   `idle_session_check_interval_secs`: janitor sweep interval (default: `5`)
 *   `idle_session_timeout_secs`: idle threshold before relay/assoc cleanup (default: `10`)
 *   `min_idle_sessions`: always keep this many most-recent idle sessions (default: `0`)
+*   `handshake_timeout_secs`: unified handshake timeout for QUIC/TCP/TLS/auth phases (default: `5`)
+*   `connection_idle_timeout_secs`: unified connection idle timeout (default: `10`)
+*   `half_close_timeout_secs`: single-direction half-close grace window before force close (default: `2`)
+
+Additional safety limits (optional):
+
+*   Client: `max_inbound_connections` (default: `512`), `max_uni_stream_tasks` (default: `256`), `max_udp_associations` (default: `1024`)
+*   Server: `max_quic_connections` (default: `1024`), `max_tcp_connections` (default: `1024`), `max_udp_associations_per_connection` (default: `1024`), `max_bi_stream_tasks_per_connection` (default: `256`)
+*   Observability: `metrics_listen` (disabled by default, set to `ip:port` to expose Prometheus metrics)
 
 Recommended baseline for low-resource VPS:
 
@@ -114,6 +135,51 @@ Recommended baseline for low-resource VPS:
 ```
 
 If you chain another local proxy layer (for example Xray -> SeaCore SOCKS), start with the defaults and then lower timeout/check interval gradually to reduce residual idle CPU cost.
+
+`max_idle_time_secs` is still accepted for backward compatibility and is used when `connection_idle_timeout_secs` is not set.
+
+## Observability
+
+SeaCore can expose a lightweight Prometheus endpoint on `metrics_listen`.
+
+Example:
+
+```bash
+curl http://127.0.0.1:9100/metrics
+```
+
+Server metrics include active authenticated connections, auth attempts/failures, REALITY fallback counts, and UDP association lifecycle counters.
+Client metrics include reconnect counts, connect attempts/successes, fallback attempts, and auth failures.
+
+## Security and Operations Docs
+
+- Security policy and disclosure workflow: `SECURITY.md`
+- Interop templates and troubleshooting runbook: `docs/interop-and-operations.md`
+- Deterministic test matrix guide: `docs/testing-matrix.md`
+
+## Testing Matrix
+
+Run protocol-level deterministic fuzz/roundtrip checks:
+
+```bash
+cargo test -p seacore-protocol
+```
+
+Run local deterministic e2e matrix (TCP/UDP stability, reconnect, NAT rebinding):
+
+```bash
+python Test/test_matrix.py
+```
+
+Wrapper scripts:
+
+```powershell
+pwsh Test/test_e2e.ps1
+```
+
+```bash
+bash Test/test_e2e.sh
+```
 
 ## Usage (Proxy Inbound)
 
@@ -138,10 +204,10 @@ curl --socks4 127.0.0.1:10800 http://1.1.1.1
 ### UDP Testing (SOCKS5 only)
 
 You can use standard SOCKS-compatible UDP tools to route DNS or internal UDP requests over SeaCore.
-If you have a Python environment, you can use the built-in test script to verify UDP associative proxies:
+For deterministic local validation (recommended), run:
 
 ```bash
-python test_udp_proxy.py
+python Test/test_matrix.py --skip-long --skip-reconnect
 ```
 
 ## Warning

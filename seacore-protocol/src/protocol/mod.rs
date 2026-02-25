@@ -10,13 +10,8 @@ pub mod ping;
 pub mod tests;
 
 pub use self::{
-    address::Address,
-    authenticate::Authenticate,
-    connect::Connect,
-    dissociate::Dissociate,
-    heartbeat::Heartbeat,
-    packet::Packet,
-    ping::Ping,
+    address::Address, authenticate::Authenticate, connect::Connect, dissociate::Dissociate,
+    heartbeat::Heartbeat, packet::Packet, ping::Ping,
 };
 
 /// The SeaCore protocol version
