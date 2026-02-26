@@ -60,6 +60,8 @@ pub struct RealityServerSettings {
     pub server_names: Vec<String>,
     pub private_key: String,
     pub short_ids: Vec<String>,
+    #[serde(default)]
+    pub tcp_dynamic_cert: bool,
 }
 
 #[derive(Clone)]
@@ -270,6 +272,8 @@ pub async fn run_server(config_path: &str) -> Result<()> {
         .with_single_cert(vec![cert_der], key_der)?;
     server_crypto.alpn_protocols = vec![b"h3".to_vec(), b"h2".to_vec(), b"http/1.1".to_vec()];
 
+    let server_crypto_for_tcp = Arc::new(server_crypto.clone());
+
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)?,
     ));
@@ -342,6 +346,14 @@ pub async fn run_server(config_path: &str) -> Result<()> {
             .collect::<Result<Vec<_>, _>>()?;
         let server_names = reality.server_names.clone();
 
+        if reality.tcp_dynamic_cert {
+            info!(
+                "REALITY TCP certificate mode: dynamic temporary certificate per authenticated connection"
+            );
+        } else {
+            info!("REALITY TCP certificate mode: static certificate reuse (optimized for low CPU)");
+        }
+
         let router = crate::router::QuicRouter::new(
             config.listen,
             actual_quinn_addr,
@@ -373,6 +385,8 @@ pub async fn run_server(config_path: &str) -> Result<()> {
         let users_clone = config.users.clone();
         let short_ids_clone = short_ids.clone();
         let server_names_clone = reality.server_names.clone();
+        let tcp_dynamic_cert = reality.tcp_dynamic_cert;
+        let server_crypto_for_tcp_listener = server_crypto_for_tcp.clone();
 
         let config_clone_for_tcp = config.clone();
         let idle_policy_clone_for_tcp = idle_policy.clone();
@@ -414,6 +428,8 @@ pub async fn run_server(config_path: &str) -> Result<()> {
                                 let tcp_replay_cache_inner = tcp_replay_cache.clone();
                                 let tcp_auth_limiter_inner = tcp_auth_limiter.clone();
                                 let server_metrics_inner = server_metrics.clone();
+                                let server_crypto_static_inner =
+                                    server_crypto_for_tcp_listener.clone();
 
                                 tokio::spawn(async move {
                                     let _permit = permit;
@@ -532,26 +548,32 @@ pub async fn run_server(config_path: &str) -> Result<()> {
                                             .unwrap_or("localhost")
                                             .to_string();
 
-                                        let server_crypto_inner =
-                                            match build_reality_temporary_tls_config(
-                                                &cert_name,
-                                                &auth.shared_secret,
-                                                &auth.token,
-                                            ) {
-                                                Ok(cfg) => cfg,
-                                                Err(e) => {
-                                                    warn!(
-                                                        "Failed to build temporary REALITY certificate for {}: {}",
-                                                        client_addr,
-                                                        e
-                                                    );
-                                                    return;
-                                                }
-                                            };
+                                        let acceptor = if tcp_dynamic_cert {
+                                            let server_crypto_inner =
+                                                match build_reality_temporary_tls_config(
+                                                    &cert_name,
+                                                    &auth.shared_secret,
+                                                    &auth.token,
+                                                ) {
+                                                    Ok(cfg) => cfg,
+                                                    Err(e) => {
+                                                        warn!(
+                                                            "Failed to build temporary REALITY certificate for {}: {}",
+                                                            client_addr,
+                                                            e
+                                                        );
+                                                        return;
+                                                    }
+                                                };
 
-                                        let acceptor = tokio_rustls::TlsAcceptor::from(
-                                            std::sync::Arc::new(server_crypto_inner),
-                                        );
+                                            tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(
+                                                server_crypto_inner,
+                                            ))
+                                        } else {
+                                            tokio_rustls::TlsAcceptor::from(
+                                                server_crypto_static_inner.clone(),
+                                            )
+                                        };
                                         match tokio::time::timeout(
                                             session_policy_inner.handshake_timeout,
                                             acceptor.accept(wrapped_stream),
@@ -1192,6 +1214,73 @@ async fn handle_server_udp_packet(
     Ok(())
 }
 
+async fn relay_tcp_mux_target(
+    assoc_id: u16,
+    seacore_conn: Connection<side::Server>,
+    target_stream: tokio::net::TcpStream,
+    mut rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    session_policy: Arc<SessionGovernancePolicy>,
+) -> std::io::Result<()> {
+    let (mut target_read, mut target_write) = target_stream.into_split();
+    let idle_timeout = session_policy.connection_idle_timeout;
+
+    let conn_download = seacore_conn.clone();
+    let mut download_task: tokio::task::JoinHandle<std::io::Result<()>> =
+        tokio::spawn(async move {
+            let mut down_buf = vec![0u8; 8192];
+            loop {
+                let n = match tokio::time::timeout(idle_timeout, target_read.read(&mut down_buf))
+                    .await
+                {
+                    Ok(Ok(n)) => n,
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => return Ok(()),
+                };
+
+                if n == 0 {
+                    return Ok(());
+                }
+
+                conn_download
+                    .packet_stream(&down_buf[..n], Address::None, assoc_id)
+                    .await
+                    .map_err(|e| std::io::Error::other(format!("packet_stream: {}", e)))?;
+            }
+        });
+
+    let mut upload_task: tokio::task::JoinHandle<std::io::Result<()>> = tokio::spawn(async move {
+        loop {
+            let maybe_payload = match tokio::time::timeout(idle_timeout, rx.recv()).await {
+                Ok(payload) => payload,
+                Err(_) => return Ok(()),
+            };
+
+            let Some(payload) = maybe_payload else {
+                return Ok(());
+            };
+
+            target_write.write_all(&payload).await?;
+        }
+    });
+
+    let relay_result: std::io::Result<()> = tokio::select! {
+        download = &mut download_task => {
+            upload_task.abort();
+            download
+                .map_err(|e| std::io::Error::other(format!("download task join error: {}", e)))??;
+            Ok(())
+        }
+        upload = &mut upload_task => {
+            download_task.abort();
+            upload
+                .map_err(|e| std::io::Error::other(format!("upload task join error: {}", e)))??;
+            Ok(())
+        }
+    };
+
+    relay_result
+}
+
 async fn handle_tcp_connection(
     seacore_conn: Connection<side::Server>,
     mut recv: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
@@ -1275,11 +1364,46 @@ async fn handle_tcp_connection(
         }
     });
 
+    let tcp_mux_routes: Arc<Mutex<HashMap<u16, tokio::sync::mpsc::Sender<bytes::Bytes>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let tcp_mux_tasks: Arc<Mutex<HashMap<u16, tokio::task::JoinHandle<()>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
     // Process remaining packets sequentially
     loop {
         match seacore_conn.next_tcp_task(recv.as_mut()).await {
             Ok(Task::Packet(pkt)) => {
                 let assoc_id = pkt.assoc_id();
+                if (assoc_id & seacore_protocol::quic::TCP_ASSOC_MASK) != 0 {
+                    let payload = match pkt.payload().await {
+                        Ok(payload) => payload,
+                        Err(e) => {
+                            warn!(
+                                "TCP mux packet payload parse failed for assoc {}: {}",
+                                assoc_id, e
+                            );
+                            continue;
+                        }
+                    };
+
+                    let tx_opt = {
+                        let routes = tcp_mux_routes.lock().await;
+                        routes.get(&assoc_id).cloned()
+                    };
+
+                    if let Some(tx) = tx_opt {
+                        if tx.send(payload).await.is_err() {
+                            tcp_mux_routes.lock().await.remove(&assoc_id);
+                            if let Some(task) = tcp_mux_tasks.lock().await.remove(&assoc_id) {
+                                task.abort();
+                            }
+                        }
+                    } else {
+                        debug!("No TCP mux route for assoc {}", assoc_id);
+                    }
+                    continue;
+                }
+
                 let addr = pkt.addr().clone();
                 if let Err(e) = handle_server_udp_packet(
                     pkt,
@@ -1297,9 +1421,12 @@ async fn handle_tcp_connection(
                 }
             }
             Ok(Task::Connect(_bistream, addr)) => {
+                let assoc_id = seacore_protocol::quic::tcp_assoc_id_from_connect_count(
+                    seacore_conn.task_connect_count(),
+                );
                 info!(
-                    "TCP CONNECT request over authenticated Reality connection to {}",
-                    addr
+                    "TCP CONNECT request over authenticated Reality connection to {} (assoc {})",
+                    addr, assoc_id
                 );
                 let target_addr_str = match &addr {
                     Address::SocketAddress(sa) => sa.to_string(),
@@ -1309,136 +1436,54 @@ async fn handle_tcp_connection(
 
                 match tokio::net::TcpStream::connect(&target_addr_str).await {
                     Ok(target_stream) => {
-                        let (mut target_ri, mut target_wi) = target_stream.into_split();
-                        let writer_conn = seacore_conn.conn.clone();
-                        let relay_result = async {
-                            let mut up_buf = vec![0u8; 8192];
-                            let mut down_buf = vec![0u8; 8192];
-                            let mut client_closed = false;
-                            let mut target_closed = false;
-                            let mut half_close_deadline: Option<Instant> = None;
+                        let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(128);
+                        tcp_mux_routes.lock().await.insert(assoc_id, tx);
 
-                            // Hold the writer lock for the whole relay.
-                            // Locking per chunk adds avoidable overhead under sustained traffic.
-                            let mut client_writer =
-                                if let seacore_protocol::quic::InnerConn::Tcp(t) = &writer_conn {
-                                    Some(t.lock().await)
-                                } else {
-                                    None
-                                };
-
-                            loop {
-                                if client_closed && target_closed {
-                                    return Ok(());
-                                }
-
-                                let wait_budget = match half_close_deadline {
-                                    Some(deadline) => {
-                                        let remain = deadline.saturating_duration_since(Instant::now());
-                                        if remain.is_zero() {
-                                            return Ok(());
-                                        }
-                                        remain.min(session_policy.connection_idle_timeout)
-                                    }
-                                    None => session_policy.connection_idle_timeout,
-                                };
-
-                                tokio::select! {
-                                    read_from_client = tokio::time::timeout(
-                                        wait_budget,
-                                        recv.read(&mut up_buf)
-                                    ), if !client_closed => {
-                                        let n = match read_from_client {
-                                            Ok(Ok(n)) => n,
-                                            Ok(Err(e)) => return Err(e),
-                                            Err(_) => return Ok(()),
-                                        };
-                                        if n == 0 {
-                                            client_closed = true;
-                                            if half_close_deadline.is_none() {
-                                                half_close_deadline = Some(Instant::now() + session_policy.half_close_timeout);
-                                            }
-                                            let _ = tokio::time::timeout(
-                                                Duration::from_millis(200),
-                                                target_wi.shutdown(),
-                                            ).await;
-                                            continue;
-                                        }
-                                        target_wi.write_all(&up_buf[..n]).await?;
-                                    }
-                                    read_from_target = tokio::time::timeout(
-                                        wait_budget,
-                                        target_ri.read(&mut down_buf)
-                                    ), if !target_closed => {
-                                        let n = match read_from_target {
-                                            Ok(Ok(n)) => n,
-                                            Ok(Err(e)) => return Err(e),
-                                            Err(_) => return Ok(()),
-                                        };
-                                        if n == 0 {
-                                            target_closed = true;
-                                            if half_close_deadline.is_none() {
-                                                half_close_deadline = Some(Instant::now() + session_policy.half_close_timeout);
-                                            }
-                                            if let Some(w) = client_writer.as_mut() {
-                                                let _ = tokio::time::timeout(
-                                                    Duration::from_millis(200),
-                                                    w.shutdown(),
-                                                ).await;
-                                            }
-                                            continue;
-                                        }
-                                        if let Some(w) = client_writer.as_mut() {
-                                            w.write_all(&down_buf[..n]).await?;
-                                        }
-                                    }
-                                }
+                        let seacore_conn_for_task = seacore_conn.clone();
+                        let tcp_mux_routes_for_task = tcp_mux_routes.clone();
+                        let tcp_mux_tasks_for_task = tcp_mux_tasks.clone();
+                        let session_policy_for_task = session_policy.clone();
+                        let relay_task = tokio::spawn(async move {
+                            let relay_result = relay_tcp_mux_target(
+                                assoc_id,
+                                seacore_conn_for_task.clone(),
+                                target_stream,
+                                rx,
+                                session_policy_for_task,
+                            )
+                            .await;
+                            if let Err(e) = relay_result {
+                                log_relay_error("TCP mux CONNECT relay error", None, &e);
                             }
-                        }
-                        .await;
 
-                        if let Err(e) = relay_result {
-                            log_relay_error("TCP CONNECT relay error", None, &e);
+                            tcp_mux_routes_for_task.lock().await.remove(&assoc_id);
+                            tcp_mux_tasks_for_task.lock().await.remove(&assoc_id);
+                            let _ = seacore_conn_for_task.dissociate(assoc_id).await;
+                        });
+                        if let Some(old_task) =
+                            tcp_mux_tasks.lock().await.insert(assoc_id, relay_task)
+                        {
+                            old_task.abort();
                         }
-
-                        udp_janitor.abort();
-                        let remaining = {
-                            let mut assocs = udp_assocs.lock().await;
-                            let remaining = assocs.len() as u64;
-                            for (_, assoc) in assocs.drain() {
-                                assoc.task.abort();
-                            }
-                            remaining
-                        };
-                        if remaining > 0 {
-                            metrics.inc_udp_assoc_closed(remaining);
-                            metrics.dec_udp_assoc_active(remaining as i64);
-                        }
-                        return Ok(());
                     }
                     Err(e) => {
                         warn!(
                             "TCP CONNECT: Failed to connect to {}: {}",
                             target_addr_str, e
                         );
-                        udp_janitor.abort();
-                        let remaining = {
-                            let mut assocs = udp_assocs.lock().await;
-                            let remaining = assocs.len() as u64;
-                            for (_, assoc) in assocs.drain() {
-                                assoc.task.abort();
-                            }
-                            remaining
-                        };
-                        if remaining > 0 {
-                            metrics.inc_udp_assoc_closed(remaining);
-                            metrics.dec_udp_assoc_active(remaining as i64);
-                        }
-                        return Ok(());
+                        let _ = seacore_conn.dissociate(assoc_id).await;
                     }
                 }
             }
             Ok(Task::Dissociate(assoc_id)) => {
+                if (assoc_id & seacore_protocol::quic::TCP_ASSOC_MASK) != 0 {
+                    tcp_mux_routes.lock().await.remove(&assoc_id);
+                    if let Some(task) = tcp_mux_tasks.lock().await.remove(&assoc_id) {
+                        task.abort();
+                    }
+                    continue;
+                }
+
                 let mut assocs = udp_assocs.lock().await;
                 if let Some(assoc) = assocs.remove(&assoc_id) {
                     assoc.task.abort();
@@ -1458,6 +1503,14 @@ async fn handle_tcp_connection(
             }
         }
     }
+
+    {
+        let mut tasks = tcp_mux_tasks.lock().await;
+        for (_, task) in tasks.drain() {
+            task.abort();
+        }
+    }
+    tcp_mux_routes.lock().await.clear();
 
     udp_janitor.abort();
 

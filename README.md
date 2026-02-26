@@ -60,7 +60,8 @@ To start the server, you need a configuration file (`server.json`) and a generat
     "private_key": "base64_encoded_private_key_here",
     "short_ids": ["0011223344556677", "8899aabbccddeeff"],
     "server_names": ["www.apple.com", "apple.com"],
-    "dest": "www.apple.com:443"
+    "dest": "www.apple.com:443",
+    "tcp_dynamic_cert": false
   }
 }
 ```
@@ -103,6 +104,11 @@ To start the client, you need a corresponding `client.json` with the matching `p
 `insecure_skip_verify` is disabled by default and should remain `false` in production.
 When `reality` is enabled, SeaCore verifies temporary trusted certificates with a REALITY proof extension and enters spider mode if a real-site certificate is observed.
 For non-REALITY deployments, prefer using `server_cert_sha256` pinning instead of disabling verification.
+
+`reality.tcp_dynamic_cert` controls TCP REALITY certificate strategy:
+
+*   `false` (default): reuse a static certificate for authenticated TCP connections (lower CPU usage, recommended on 1C/1G VPS)
+*   `true`: generate a temporary trusted certificate per authenticated TCP connection (stronger anti-detection semantics, higher CPU cost)
 
 Start the client process:
 ```bash

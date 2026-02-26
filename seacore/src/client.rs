@@ -86,6 +86,8 @@ fn default_server_name() -> String {
 type PacketSender = mpsc::Sender<(bytes::Bytes, Address)>;
 type UdpRoutes = Arc<Mutex<HashMap<u16, PacketSender>>>;
 type UdpRouteTouches = Arc<Mutex<HashMap<u16, Instant>>>;
+type TcpMuxPacketSender = mpsc::Sender<bytes::Bytes>;
+type TcpMuxRoutes = Arc<Mutex<HashMap<u16, TcpMuxPacketSender>>>;
 
 #[derive(Clone)]
 struct IdleSessionPolicy {
@@ -114,6 +116,11 @@ static REALITY_HANDSHAKE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new(
 const DEFAULT_MAX_INBOUND_CONNECTIONS: usize = 512;
 const DEFAULT_MAX_UNI_STREAM_TASKS: usize = 256;
 const DEFAULT_MAX_UDP_ASSOCIATIONS: usize = 1024;
+
+const SOCKS4_REPLY_GRANTED: [u8; 8] = [0x00, 0x5A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+const SOCKS4_REPLY_REJECTED: [u8; 8] = [0x00, 0x5B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+const SOCKS5_REPLY_SUCCEEDED: [u8; 10] = [0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+const SOCKS5_REPLY_GENERAL_FAILURE: [u8; 10] = [0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
 
 fn reality_secret_store() -> &'static StdMutex<StaticSecret> {
     REALITY_CLIENT_SECRET.get_or_init(|| StdMutex::new(StaticSecret::random_from_rng(OsRng)))
@@ -864,12 +871,14 @@ pub async fn run_client(config_path: &str) -> Result<()> {
 
         let udp_routes: UdpRoutes = Arc::new(Mutex::new(HashMap::new()));
         let udp_route_touches: UdpRouteTouches = Arc::new(Mutex::new(HashMap::new()));
+        let tcp_mux_routes: TcpMuxRoutes = Arc::new(Mutex::new(HashMap::new()));
 
         // Background task for receiving server packets
         let bg_conn = conn.clone();
         let bg_seacore = seacore_conn.clone();
         let bg_routes = udp_routes.clone();
         let bg_route_touches = udp_route_touches.clone();
+        let bg_tcp_routes = tcp_mux_routes.clone();
         let disconnect_tx_bg = disconnect_tx.clone();
         let uni_stream_task_limiter_bg = uni_stream_task_limiter.clone();
         let mut tcp_read = tcp_read_half;
@@ -975,11 +984,26 @@ pub async fn run_client(config_path: &str) -> Result<()> {
                         let bg_seacore_clone = bg_seacore.clone();
                         let bg_routes_clone = bg_routes.clone();
                         let bg_route_touches_clone = bg_route_touches.clone();
+                        let bg_tcp_routes_clone = bg_tcp_routes.clone();
                         loop {
                             match bg_seacore_clone.next_tcp_task(recv.as_mut()).await {
                                 Ok(task) => match task {
                                     Task::Packet(pkt) => {
                                         let assoc_id = pkt.assoc_id();
+                                        if (assoc_id & seacore_protocol::quic::TCP_ASSOC_MASK) != 0
+                                        {
+                                            if let Ok(payload) = pkt.payload().await {
+                                                let tx_opt = {
+                                                    let routes = bg_tcp_routes_clone.lock().await;
+                                                    routes.get(&assoc_id).cloned()
+                                                };
+                                                if let Some(tx) = tx_opt {
+                                                    let _ = tx.send(payload).await;
+                                                }
+                                            }
+                                            continue;
+                                        }
+
                                         let addr = pkt.addr().clone();
                                         if let Ok(payload) = pkt.payload().await {
                                             {
@@ -1008,6 +1032,12 @@ pub async fn run_client(config_path: &str) -> Result<()> {
                                         }
                                     }
                                     Task::Heartbeat => {}
+                                    Task::Dissociate(assoc_id) => {
+                                        if (assoc_id & seacore_protocol::quic::TCP_ASSOC_MASK) != 0
+                                        {
+                                            bg_tcp_routes_clone.lock().await.remove(&assoc_id);
+                                        }
+                                    }
                                     _ => {}
                                 },
                                 Err(e) => {
@@ -1090,12 +1120,13 @@ pub async fn run_client(config_path: &str) -> Result<()> {
                                 let sc = seacore_conn.clone();
                                 let ur = udp_routes.clone();
                                 let ut = udp_route_touches.clone();
+                                let tr = tcp_mux_routes.clone();
                                 let ip = idle_policy_socks.clone();
                                 let sp = session_policy_socks.clone();
                                 let cfg = config_socks.clone();
                                 tokio::spawn(async move {
                                     let _permit = permit;
-                                    if let Err(e) = handle_inbound(stream, sc, peer_addr, ur, ut, ip, sp, cfg).await {
+                                    if let Err(e) = handle_inbound(stream, sc, peer_addr, ur, ut, tr, ip, sp, cfg).await {
                                         warn!("Inbound handler error for {}: {}", peer_addr, e);
                                     }
                                 });
@@ -1130,6 +1161,7 @@ async fn handle_inbound(
     peer_addr: SocketAddr,
     udp_routes: UdpRoutes,
     udp_route_touches: UdpRouteTouches,
+    tcp_mux_routes: TcpMuxRoutes,
     idle_policy: Arc<IdleSessionPolicy>,
     session_policy: Arc<SessionGovernancePolicy>,
     config: Arc<ClientConfig>,
@@ -1145,6 +1177,7 @@ async fn handle_inbound(
                 peer_addr,
                 udp_routes,
                 udp_route_touches,
+                tcp_mux_routes,
                 idle_policy,
                 session_policy.clone(),
                 config,
@@ -1158,7 +1191,7 @@ async fn handle_inbound(
                 peer_addr,
                 session_policy.connection_idle_timeout,
                 session_policy.half_close_timeout,
-                session_policy.handshake_timeout,
+                tcp_mux_routes,
                 config,
             )
             .await
@@ -1267,6 +1300,90 @@ where
     relay_result.map(|_| ())
 }
 
+async fn relay_tcp_mux(
+    mut stream: tokio::net::TcpStream,
+    conn: Connection<side::Client>,
+    peer_addr: SocketAddr,
+    addr: Address,
+    tcp_mux_routes: TcpMuxRoutes,
+    idle_timeout: Duration,
+    success_reply: &[u8],
+    failure_reply: &[u8],
+) -> Result<()> {
+    let assoc_id = match conn.connect_tcp_tunnel(addr.clone()).await {
+        Ok(assoc_id) => assoc_id,
+        Err(e) => {
+            let _ = stream.write_all(failure_reply).await;
+            return Err(eyre::eyre!(
+                "failed to open TCP mux tunnel for {} -> {}: {}",
+                peer_addr,
+                addr,
+                e
+            ));
+        }
+    };
+
+    let (tx, mut rx) = mpsc::channel::<bytes::Bytes>(128);
+    tcp_mux_routes.lock().await.insert(assoc_id, tx);
+
+    stream.write_all(success_reply).await?;
+
+    let (mut client_read, mut client_write) = tokio::io::split(stream);
+
+    let conn_upload = conn.clone();
+    let mut upload_task: tokio::task::JoinHandle<std::io::Result<()>> = tokio::spawn(async move {
+        let mut up_buf = vec![0u8; 8192];
+        loop {
+            let n = match tokio::time::timeout(idle_timeout, client_read.read(&mut up_buf)).await {
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Ok(()),
+            };
+            if n == 0 {
+                return Ok(());
+            }
+            conn_upload
+                .packet_stream(&up_buf[..n], Address::None, assoc_id)
+                .await
+                .map_err(|e| std::io::Error::other(format!("packet_stream: {}", e)))?;
+        }
+    });
+
+    let mut download_task: tokio::task::JoinHandle<std::io::Result<()>> =
+        tokio::spawn(async move {
+            loop {
+                let maybe_payload = match tokio::time::timeout(idle_timeout, rx.recv()).await {
+                    Ok(payload) => payload,
+                    Err(_) => return Ok(()),
+                };
+
+                let Some(payload) = maybe_payload else {
+                    return Ok(());
+                };
+
+                client_write.write_all(&payload).await?;
+            }
+        });
+
+    let relay_result: Result<()> = tokio::select! {
+        upload = &mut upload_task => {
+            download_task.abort();
+            upload.map_err(|e| eyre::eyre!("tcp mux upload task join error: {}", e))??;
+            Ok(())
+        }
+        download = &mut download_task => {
+            upload_task.abort();
+            download.map_err(|e| eyre::eyre!("tcp mux download task join error: {}", e))??;
+            Ok(())
+        }
+    };
+
+    tcp_mux_routes.lock().await.remove(&assoc_id);
+    let _ = conn.dissociate(assoc_id).await;
+
+    relay_result
+}
+
 fn is_expected_relay_io_error(err: &std::io::Error) -> bool {
     matches!(
         err.kind(),
@@ -1293,7 +1410,7 @@ async fn handle_socks4(
     peer_addr: SocketAddr,
     connection_idle_timeout: Duration,
     half_close_timeout: Duration,
-    handshake_timeout: Duration,
+    tcp_mux_routes: TcpMuxRoutes,
     config: Arc<ClientConfig>,
 ) -> Result<()> {
     // SOCKS4 handshake (already read VN=0x04)
@@ -1345,100 +1462,18 @@ async fn handle_socks4(
     let transport_mode = config.transport.as_deref().unwrap_or("auto").to_lowercase();
 
     if transport_mode == "tcp" {
-        // 1:1 TCP fallback
-        let server_addr = config.server;
-        let tcp_stream = tokio::time::timeout(
-            handshake_timeout,
-            tokio::net::TcpStream::connect(server_addr),
-        )
-        .await
-        .map_err(|_| {
-            eyre::eyre!(
-                "SOCKS4 TCP connect timed out after {}s",
-                handshake_timeout.as_secs()
-            )
-        })??;
-        let domain_sni = config
-            .reality
-            .as_ref()
-            .map(|r| r.server_name.clone())
-            .unwrap_or_else(|| "apple.com".into());
-        let mut tls_stream = {
-            let _reality_handshake_guard = reality_handshake_lock().lock().await;
-            let (tcp_tls_config, reality_cert_state) = build_tls_config(&config)?;
-            if let Some(state) = &reality_cert_state {
-                state.reset();
-            }
-            let connector = tokio_rustls::TlsConnector::from(Arc::new(tcp_tls_config));
-            let server_name =
-                rustls::pki_types::ServerName::try_from(domain_sni.as_str())?.to_owned();
-            let mut tls_stream = tokio::time::timeout(
-                handshake_timeout,
-                connector.connect(server_name, tcp_stream),
-            )
-            .await
-            .map_err(|_| {
-                eyre::eyre!(
-                    "SOCKS4 TLS handshake timed out after {}s",
-                    handshake_timeout.as_secs()
-                )
-            })??;
-
-            if reality_cert_state
-                .as_ref()
-                .map(RealityCertState::saw_real_certificate)
-                .unwrap_or(false)
-            {
-                warn!(
-                    "SOCKS4 REALITY received real certificate for {}; entering spider mode",
-                    domain_sni
-                );
-                let spider_x = config
-                    .reality
-                    .as_ref()
-                    .and_then(|r| r.spider_x.as_deref())
-                    .unwrap_or("/");
-                let _ = run_reality_spider(&mut tls_stream, &domain_sni, spider_x).await;
-                stream
-                    .write_all(&[0x00, 0x5B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
-                    .await?;
-                return Err(eyre::eyre!(
-                    "REALITY rejected as real-site certificate; spider mode triggered"
-                ));
-            }
-
-            tls_stream
-        };
-
-        // Authenticate
-        let uuid = config.uuid;
-        let model = seacore_protocol::model::Connection::<Vec<u8>>::new();
-        let auth_data = model.send_authenticate(uuid, &config.password, None::<&NoExporter>);
-        let header = seacore_protocol::protocol::Header::Authenticate(auth_data);
-        header.async_marshal(&mut tls_stream).await?;
-
-        // Connect
-        let conn_data = model.send_connect(addr.clone());
-        let header_conn = seacore_protocol::protocol::Header::Connect(conn_data);
-        header_conn.async_marshal(&mut tls_stream).await?;
-
-        info!("SOCKS4 TCP Fallback: {} -> {}", peer_addr, addr);
-
-        // Reply: Granted
-        stream
-            .write_all(&[0x00, 0x5A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
-            .await?;
-
-        if let Err(e) = relay_until_either_side_finishes(
+        info!("SOCKS4 TCP Mux: {} -> {}", peer_addr, addr);
+        return relay_tcp_mux(
             stream,
-            tls_stream,
+            conn,
+            peer_addr,
+            addr,
+            tcp_mux_routes,
             connection_idle_timeout,
-            half_close_timeout,
+            &SOCKS4_REPLY_GRANTED,
+            &SOCKS4_REPLY_REJECTED,
         )
-        .await
-        {
-            log_relay_error("SOCKS4 TCP relay error", peer_addr, e);
-        }
+        .await;
     } else {
         // QUIC mode
         match conn.connect(addr.clone()).await {
@@ -1478,6 +1513,7 @@ async fn handle_socks5_logic(
     peer_addr: SocketAddr,
     udp_routes: UdpRoutes,
     udp_route_touches: UdpRouteTouches,
+    tcp_mux_routes: TcpMuxRoutes,
     idle_policy: Arc<IdleSessionPolicy>,
     session_policy: Arc<SessionGovernancePolicy>,
     config: Arc<ClientConfig>,
@@ -1751,103 +1787,21 @@ async fn handle_socks5_logic(
 
     let transport_mode = config.transport.as_deref().unwrap_or("auto").to_lowercase();
 
-    let remote = if transport_mode == "tcp" {
-        // --- Phase 19/15: 1:1 Transparent TCP TLS Fallback ---
-        let server_addr = config.server;
-        let tcp_stream = tokio::time::timeout(
-            session_policy.handshake_timeout,
-            tokio::net::TcpStream::connect(server_addr),
-        )
-        .await
-        .map_err(|_| {
-            eyre::eyre!(
-                "SOCKS5 TCP connect timed out after {}s",
-                session_policy.handshake_timeout.as_secs()
-            )
-        })??;
-
-        let domain = config
-            .reality
-            .as_ref()
-            .map(|r| r.server_name.clone())
-            .unwrap_or_else(|| "apple.com".into());
-        // 1. Establish TLS with Reality Tokens
-        let mut tls_stream = {
-            let _reality_handshake_guard = reality_handshake_lock().lock().await;
-            let (tcp_tls_config, reality_cert_state) = build_tls_config(&config)?;
-            if let Some(state) = &reality_cert_state {
-                state.reset();
-            }
-            let connector = tokio_rustls::TlsConnector::from(Arc::new(tcp_tls_config));
-            let server_name = rustls::pki_types::ServerName::try_from(domain.as_str())?.to_owned();
-            let mut tls_stream = tokio::time::timeout(
-                session_policy.handshake_timeout,
-                connector.connect(server_name, tcp_stream),
-            )
-            .await
-            .map_err(|_| {
-                eyre::eyre!(
-                    "SOCKS5 TLS handshake timed out after {}s",
-                    session_policy.handshake_timeout.as_secs()
-                )
-            })??;
-
-            if reality_cert_state
-                .as_ref()
-                .map(RealityCertState::saw_real_certificate)
-                .unwrap_or(false)
-            {
-                warn!(
-                    "SOCKS5 REALITY received real certificate for {}; entering spider mode",
-                    domain
-                );
-                let spider_x = config
-                    .reality
-                    .as_ref()
-                    .and_then(|r| r.spider_x.as_deref())
-                    .unwrap_or("/");
-                let _ = run_reality_spider(&mut tls_stream, &domain, spider_x).await;
-                stream
-                    .write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-                    .await?;
-                return Err(eyre::eyre!(
-                    "REALITY rejected as real-site certificate; spider mode triggered"
-                ));
-            }
-
-            tls_stream
-        };
-
-        // 2. Send Authenticate Command manually over the raw TLS stream
-        let uuid = config.uuid;
-        let model = seacore_protocol::model::Connection::<Vec<u8>>::new();
-        let auth_data = model.send_authenticate(uuid, &config.password, None::<&NoExporter>);
-        let header = seacore_protocol::protocol::Header::Authenticate(auth_data);
-        header.async_marshal(&mut tls_stream).await?;
-
-        // 3. Send Connect Command
-        let conn_data = model.send_connect(addr.clone());
-        let header_conn = seacore_protocol::protocol::Header::Connect(conn_data);
-        header_conn.async_marshal(&mut tls_stream).await?;
-
-        info!("SOCKS5 TCP Fallback: {} -> {}", peer_addr, addr);
-
-        stream
-            .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-            .await?;
-
-        if let Err(e) = relay_until_either_side_finishes(
+    if transport_mode == "tcp" {
+        return relay_tcp_mux(
             stream,
-            tls_stream,
+            conn,
+            peer_addr,
+            addr,
+            tcp_mux_routes,
             session_policy.connection_idle_timeout,
-            session_policy.half_close_timeout,
+            &SOCKS5_REPLY_SUCCEEDED,
+            &SOCKS5_REPLY_GENERAL_FAILURE,
         )
-        .await
-        {
-            log_relay_error("SOCKS5 TCP relay error", peer_addr, e);
-        }
-        return Ok(());
-    } else {
+        .await;
+    }
+
+    let remote = {
         // Open SeaCore Connect stream (QUIC multiplexed)
         match conn.connect(addr).await {
             Ok(s) => s,
@@ -2068,14 +2022,6 @@ impl rustls::client::danger::ServerCertVerifier for SeaCoreServerVerifier {
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         rustls::client::danger::ServerCertVerifier::supported_verify_schemes(self.webpki.as_ref())
-    }
-}
-
-// --- Dummy Exporter for TCP Fallback ---
-struct NoExporter;
-impl seacore_protocol::model::KeyingMaterialExporter for NoExporter {
-    fn export_keying_material(&self, _label: &[u8], _context: &[u8]) -> [u8; 32] {
-        [0u8; 32]
     }
 }
 

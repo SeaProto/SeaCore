@@ -11,7 +11,6 @@ use quinn::{
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -44,6 +43,12 @@ pub struct Connection<Side> {
     pub conn: InnerConn,
     model: ConnectionModel<Bytes>,
     _marker: Side,
+}
+
+pub const TCP_ASSOC_MASK: u16 = 0x8000;
+
+pub fn tcp_assoc_id_from_connect_count(connect_count: u16) -> u16 {
+    connect_count | TCP_ASSOC_MASK
 }
 
 impl<Side> Connection<Side> {
@@ -162,6 +167,26 @@ impl<Side> Connection<Side> {
             InnerConn::Tcp(_) => None, // Handled manually for TCP fallback
         }
     }
+
+    /// Sends a `Dissociate` command.
+    pub async fn dissociate(&self, assoc_id: u16) -> Result<(), Error> {
+        let header_data = self.model.send_dissociate(assoc_id);
+        let header = Header::Dissociate(header_data);
+        match &self.conn {
+            InnerConn::Quic(q) => {
+                let mut send = SeaCoreWriteStream::Quic(q.open_uni().await?);
+                header.async_marshal(&mut send).await?;
+                if let SeaCoreWriteStream::Quic(mut inner) = send {
+                    inner.finish().map_err(|e| Error::StreamClosed(e))?;
+                }
+            }
+            InnerConn::Tcp(t) => {
+                let mut tcp_lock = t.lock().await;
+                header.async_marshal(&mut *tcp_lock).await?;
+            }
+        }
+        Ok(())
+    }
 }
 
 // ── Client side ────────────────────────────────
@@ -220,24 +245,24 @@ impl Connection<side::Client> {
         }
     }
 
-    /// Sends a `Dissociate` command via uni-stream
-    pub async fn dissociate(&self, assoc_id: u16) -> Result<(), Error> {
-        let header_data = self.model.send_dissociate(assoc_id);
-        let header = Header::Dissociate(header_data);
+    /// Sends a `Connect` command over shared TCP and returns a virtual assoc id.
+    ///
+    /// The returned assoc id can be used with `packet_stream` as a framed TCP data channel.
+    pub async fn connect_tcp_tunnel(&self, addr: Address) -> Result<u16, Error> {
         match &self.conn {
-            InnerConn::Quic(q) => {
-                let mut send = SeaCoreWriteStream::Quic(q.open_uni().await?);
-                header.async_marshal(&mut send).await?;
-                if let SeaCoreWriteStream::Quic(mut inner) = send {
-                    inner.finish().map_err(|e| Error::StreamClosed(e))?;
-                }
-            }
             InnerConn::Tcp(t) => {
+                let header_data = self.model.send_connect(addr);
+                let header = Header::Connect(header_data);
                 let mut tcp_lock = t.lock().await;
                 header.async_marshal(&mut *tcp_lock).await?;
+                Ok(tcp_assoc_id_from_connect_count(
+                    self.model.task_connect_count(),
+                ))
             }
+            InnerConn::Quic(_) => Err(Error::BadCommand(
+                "connect_tcp_tunnel is only available in TCP mode".into(),
+            )),
         }
-        Ok(())
     }
 
     /// Parse a uni-stream as a SeaCore command (Client side normally only receives Packets or Dissociate)
@@ -410,7 +435,8 @@ impl Connection<side::Server> {
                 Ok(Task::Dissociate(dissoc.assoc_id()))
             }
             Header::Connect(conn) => {
-                let addr = conn.addr().clone();
+                let model_conn = self.model.recv_connect(conn);
+                let addr = model_conn.addr().clone();
                 // In TCP 1:1 mode, the BiStream is handled by the caller.
                 // We return empty placeholders for now.
                 Ok(Task::Connect(
